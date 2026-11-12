@@ -1,5 +1,6 @@
 name: lite-ipa
 
+# Builds Pinky's iPhone app (lite scheme) only — no desktop, no tests.
 on:
   workflow_dispatch:
     inputs:
@@ -11,7 +12,7 @@ on:
 jobs:
   build:
     runs-on: macos-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -23,24 +24,29 @@ jobs:
       - name: xcodegen
         run: command -v xcodegen >/dev/null || brew install --quiet xcodegen
 
-      - name: Build lite, unsigned
+      - name: Unpack WebDriverAgent test bundle
+        run: |
+          mkdir -p ci-assets/wda
+          tar -xzf ci-assets/wda.xctest.tar.gz -C ci-assets/wda
+          test -d ci-assets/wda/WebDriverAgentRunner.xctest
+
+      - name: Build lite (unsigned, with WDA)
         env:
           PINKY_SIGN: "0"
           PINKY_BUNDLE_ID: ${{ inputs.bundle_id }}
+          PINKY_WDA: ${{ github.workspace }}/ci-assets/wda/WebDriverAgentRunner.xctest
         run: ./ios/build.sh lite
 
       - name: Pack unsigned ipa
         run: |
           APP="ios/app/build/dd/Build/Products/Debug-iphoneos/PinkyLite.app"
           test -d "$APP"
-          echo "--- app bundle ---"
-          find "$APP" -maxdepth 2 | head -40
+          ls -d "$APP"/PlugIns/* || true
           mkdir -p out/Payload
           cp -R "$APP" out/Payload/
           cd out
           zip -qry pinky-lite-unsigned.ipa Payload
-          echo "--- ipa ---"
-          unzip -l pinky-lite-unsigned.ipa | tail -20
+          unzip -l pinky-lite-unsigned.ipa | tail -12
 
       - uses: actions/upload-artifact@v4
         with:
