@@ -1,0 +1,49 @@
+name: lite-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "Bundle id for the lite app"
+        required: false
+        default: "com.example.pinky.lite"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: xcodegen
+        run: command -v xcodegen >/dev/null || brew install --quiet xcodegen
+
+      - name: Build lite, unsigned
+        env:
+          PINKY_SIGN: "0"
+          PINKY_BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: ./ios/build.sh lite
+
+      - name: Pack unsigned ipa
+        run: |
+          APP="ios/app/build/dd/Build/Products/Debug-iphoneos/PinkyLite.app"
+          test -d "$APP"
+          echo "--- app bundle ---"
+          find "$APP" -maxdepth 2 | head -40
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out
+          zip -qry pinky-lite-unsigned.ipa Payload
+          echo "--- ipa ---"
+          unzip -l pinky-lite-unsigned.ipa | tail -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pinky-lite-unsigned
+          path: out/pinky-lite-unsigned.ipa
+          if-no-files-found: error
