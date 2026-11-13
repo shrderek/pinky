@@ -13,6 +13,13 @@ on:
         required: false
         default: "macos-15-intel"
 
+env:
+  # The release Pinky builds its own helper from (internal/driver/ios/simwda.go):
+  # a commit, which does not move, and the hash of its files.
+  WDA_COMMIT: 02cb92f0e93c8b021443bcbb8eeb80932c113220
+  WDA_SOURCE_TREE: 05f62a92a9136fcf7a0e00538d5acd47d4bdd43f375e14260fc2c718eeb2e3cf
+  WDA_VERSION: 16.15.3
+
 jobs:
   build:
     runs-on: ${{ inputs.runner }}
@@ -28,17 +35,32 @@ jobs:
       - name: xcodegen
         run: command -v xcodegen >/dev/null || brew install --quiet xcodegen
 
-      - name: Unpack WebDriverAgent test bundle
+      - name: Download WebDriverAgent source (pinned commit)
         run: |
           mkdir -p ci-assets/wda
-          tar -xzf ci-assets/wda.xctest.tar.gz -C ci-assets/wda
-          test -d ci-assets/wda/WebDriverAgentRunner.xctest
+          curl -fsSL -o ci-assets/wda.tar.gz \
+            "https://github.com/appium/WebDriverAgent/archive/${WDA_COMMIT}.tar.gz"
+          tar -xzf ci-assets/wda.tar.gz -C ci-assets/wda --strip-components=1
+          python3 .github/wda-source-check.py ci-assets/wda "$WDA_SOURCE_TREE"
+          plutil -extract CFBundleShortVersionString raw -o - \
+            ci-assets/wda/WebDriverAgentLib/Info.plist | grep -qx "$WDA_VERSION"
+          echo "WebDriverAgent $WDA_VERSION, the release Pinky builds"
+
+      - name: Build WebDriverAgent (unsigned, for the phone)
+        run: |
+          xcodebuild build-for-testing \
+            -project ci-assets/wda/WebDriverAgent.xcodeproj \
+            -scheme WebDriverAgentRunner \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ci-assets/dd \
+            CODE_SIGNING_ALLOWED=NO
+          test -d ci-assets/dd/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app/PlugIns/WebDriverAgentRunner.xctest
 
       - name: Build lite (unsigned, with WDA)
         env:
           PINKY_SIGN: "0"
           PINKY_BUNDLE_ID: ${{ inputs.bundle_id }}
-          PINKY_WDA: ${{ github.workspace }}/ci-assets/wda/WebDriverAgentRunner.xctest
+          PINKY_WDA: ${{ github.workspace }}/ci-assets/dd/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app/PlugIns/WebDriverAgentRunner.xctest
         run: ./ios/build.sh lite
 
       - name: Pack unsigned ipa
@@ -46,6 +68,8 @@ jobs:
           APP="ios/app/build/dd/Build/Products/Debug-iphoneos/PinkyLite.app"
           test -d "$APP"
           ls -d "$APP"/PlugIns/* || true
+          plutil -extract CFBundleShortVersionString raw -o - \
+            "$APP"/PlugIns/WebDriverAgentRunner.xctest/Frameworks/WebDriverAgentLib.framework/Info.plist
           mkdir -p out/Payload
           cp -R "$APP" out/Payload/
           cd out
