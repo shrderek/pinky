@@ -70,6 +70,18 @@ enum TestHost {
                 return
             }
             log.log("pinky testhost: running the test with XCTest at \(path, privacy: .public)")
+            // WDA's HTTP server (CocoaHTTPServer over GCDAsyncSocket) can
+            // only be pinned to the loopback: any other explicit address,
+            // the tunnel's IPv6 one included, makes it fail with
+            // GCDAsyncSocketErrorDomain Code=2 "Unknown interface" and
+            // abort. Pinky on a computer hands over the tunnel address on
+            // Wi-Fi (wdaBind), which killed the app on the spot
+            // (2026-11-13). Without USE_IP WDA listens on every interface,
+            // so both the cable's loopback and the Wi-Fi tunnel answer.
+            if let ip = ProcessInfo.processInfo.environment["USE_IP"], ip != "127.0.0.1" {
+                unsetenv("USE_IP")
+                log.log("pinky testhost: dropped USE_IP=\(ip, privacy: .public); WDA listens on every interface")
+            }
             // _XCTestMain takes the test configuration; nil makes XCTest
             // read it from the environment testmanagerd set, as XCTRunner
             // does. Called without one, it took whatever the first
