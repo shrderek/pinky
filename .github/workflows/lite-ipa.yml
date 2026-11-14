@@ -1,0 +1,121 @@
+name: lite-ipa
+
+# Builds Pinky's iPhone app (lite scheme) only — no desktop, no tests.
+#
+# This copy builds everything with one Xcode, as upstream does, to see
+# whether Xcode 26 and the iOS 26 SDK build the app and the pinned
+# WebDriverAgent as they stand — the app needs the iOS 26 SDK for
+# Look.swift's ToolbarItem(placement: .largeTitle).
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "Bundle id for the lite app"
+        required: false
+        default: "com.example.pinky.lite"
+      runner:
+        description: "macOS runner label"
+        required: false
+        default: "macos-15"
+      xcode:
+        description: "Xcode to build with, as the version prefix of /Applications/Xcode_<x>.app (e.g. 26, 26.0)"
+        required: false
+        default: "26"
+
+env:
+  # The release Pinky builds its own helper from (internal/driver/ios/simwda.go):
+  # a commit, which does not move, and the hash of its files.
+  WDA_COMMIT: 02cb92f0e93c8b021443bcbb8eeb80932c113220
+  WDA_SOURCE_TREE: 05f62a92a9136fcf7a0e00538d5acd47d4bdd43f375e14260fc2c718eeb2e3cf
+  WDA_VERSION: 16.15.3
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick Xcode
+        run: |
+          echo "== Xcodes on this image =="
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          echo "== default =="
+          xcodebuild -version || true
+          xcrun --sdk iphoneos --show-sdk-version || true
+          want="${{ inputs.xcode }}"
+          pick=$(ls -d /Applications/Xcode_${want}*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$pick" ]; then
+            echo "::error::neither an Xcode ${want}.x nor /Applications/Xcode_${want}*.app on this image; the list is above"
+            exit 1
+          fi
+          echo "using $pick"
+          sudo xcode-select -s "$pick"
+          echo "== now =="
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: xcodegen
+        run: command -v xcodegen >/dev/null || brew install --quiet xcodegen
+
+      - name: Download WebDriverAgent source (pinned commit)
+        run: |
+          mkdir -p ci-assets/wda
+          curl -fsSL -o ci-assets/wda.tar.gz \
+            "https://github.com/appium/WebDriverAgent/archive/${WDA_COMMIT}.tar.gz"
+          tar -xzf ci-assets/wda.tar.gz -C ci-assets/wda --strip-components=1
+          python3 .github/wda-source-check.py ci-assets/wda "$WDA_SOURCE_TREE"
+          plutil -extract CFBundleShortVersionString raw -o - \
+            ci-assets/wda/WebDriverAgentLib/Info.plist | grep -qx "$WDA_VERSION"
+          echo "WebDriverAgent $WDA_VERSION, the release Pinky builds"
+
+      - name: Build WebDriverAgent (unsigned, for the phone)
+        run: |
+          xcodebuild build-for-testing \
+            -project ci-assets/wda/WebDriverAgent.xcodeproj \
+            -scheme WebDriverAgentRunner \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ci-assets/dd \
+            CODE_SIGNING_ALLOWED=NO
+          test -d ci-assets/dd/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app/PlugIns/WebDriverAgentRunner.xctest
+
+      - name: Build lite (unsigned, with WDA)
+        env:
+          PINKY_SIGN: "0"
+          PINKY_BUNDLE_ID: ${{ inputs.bundle_id }}
+          PINKY_WDA: ${{ github.workspace }}/ci-assets/dd/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app/PlugIns/WebDriverAgentRunner.xctest
+        run: ./ios/build.sh lite
+
+      - name: Pack unsigned ipa
+        run: |
+          APP="ios/app/build/dd/Build/Products/Debug-iphoneos/PinkyLite.app"
+          test -d "$APP"
+          ls -d "$APP"/PlugIns/* || true
+          plutil -extract CFBundleShortVersionString raw -o - \
+            "$APP"/PlugIns/WebDriverAgentRunner.xctest/Frameworks/WebDriverAgentLib.framework/Info.plist
+          echo "== what the app was built with =="
+          for k in MinimumOSVersion DTPlatformVersion DTSDKName DTXcodeBuild CFBundleIdentifier; do
+            printf '%s = ' "$k"
+            plutil -extract "$k" raw -o - "$APP"/Info.plist || echo "(none)"
+          done
+          echo "== what the test bundle was built with =="
+          for k in MinimumOSVersion DTPlatformVersion DTSDKName DTXcodeBuild; do
+            printf '%s = ' "$k"
+            plutil -extract "$k" raw -o - "$APP"/PlugIns/WebDriverAgentRunner.xctest/Info.plist || echo "(none)"
+          done
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out
+          zip -qry pinky-lite-unsigned.ipa Payload
+          unzip -l pinky-lite-unsigned.ipa | tail -12
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pinky-lite-unsigned
+          path: out/pinky-lite-unsigned.ipa
+          if-no-files-found: error
