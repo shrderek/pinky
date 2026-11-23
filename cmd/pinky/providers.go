@@ -66,7 +66,7 @@ func newAndroidProvider(log *slog.Logger) (driver.Provider, error) {
 		idFile = filepath.Join(dirs.Config, "phone-identities.json")
 		// The phones that ignore Pinky's change to their accessibility
 		// settings (vivo's OriginOS 6), where Pinky leaves on the service
-		// of Pinky for Android that the person turned on.
+		// of Pinky on the phone that the person turned on.
 		manualFile = filepath.Join(dirs.Config, "companion-manual-phones.json")
 	}
 	// adb's own discovery stops seeing the network after the computer's
@@ -336,7 +336,7 @@ func (p *onlyPairer) ConnectWiFi(ctx context.Context, addr string) (driver.Info,
 	return info, err
 }
 
-// Tailnet, ConnectTailnet, Away and SetAway pass Tailscale on
+// Tailnet, ConnectTailnet, Away, SetAway and SetAwayAt pass Tailscale on
 // (driver.Tailnet); a phone connected through it joins the phones Pinky
 // may use, as a pairing does.
 func (p *onlyPairer) Tailnet(ctx context.Context) (driver.TailnetStatus, error) {
@@ -373,6 +373,14 @@ func (p *onlyPairer) SetAway(ctx context.Context, id string, on bool) (driver.Aw
 		return driver.Away{}, fmt.Errorf("tailscale: %w", driver.ErrUnsupported)
 	}
 	return t.SetAway(ctx, id, on)
+}
+
+func (p *onlyPairer) SetAwayAt(ctx context.Context, id, addr string) (driver.Away, error) {
+	t, ok := p.pairer.(driver.TailnetByHand)
+	if !ok || !p.allowed(id) {
+		return driver.Away{}, fmt.Errorf("tailscale: %w", driver.ErrUnsupported)
+	}
+	return t.SetAwayAt(ctx, id, addr)
 }
 
 // PhoneWiFi and SetPhoneWiFi pass the Wi-Fi switch for Android phones

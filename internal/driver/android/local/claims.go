@@ -58,9 +58,13 @@ func (c *Claims) Watch(ctx context.Context, changed, lost func()) {
 		c.sub = sub
 		close(c.ready)
 		c.mu.Unlock()
-		if !c.reclaim(ctx, sub) {
-			go lost()
-		}
+		// Reclaim beside the loop: a request that holds c.op while it
+		// waits for the next subscription must not wait on this one.
+		go func(sub *companion.Subscription) {
+			if !c.reclaim(ctx, sub) && ctx.Err() == nil {
+				lost()
+			}
+		}(sub)
 		for ev := range sub.C() {
 			if ev.Kind != companion.EventClaim {
 				continue
@@ -81,14 +85,15 @@ func (c *Claims) Watch(ctx context.Context, changed, lost func()) {
 }
 
 // reclaim makes the claim the core held on a new subscription; false when
-// that failed and the claim is gone.
+// that failed and the claim is gone. A subscription that already ended
+// leaves it to the next one.
 func (c *Claims) reclaim(ctx context.Context, sub *companion.Subscription) bool {
 	c.op.Lock()
 	defer c.op.Unlock()
 	c.mu.Lock()
-	held, task := c.held, c.task
+	held, task, current := c.held, c.task, c.sub == sub
 	c.mu.Unlock()
-	if !held {
+	if !held || !current {
 		return true
 	}
 	if err := sub.Claim(ctx, companion.ByPhone, task); err != nil {
@@ -105,11 +110,10 @@ func (c *Claims) reclaim(ctx context.Context, sub *companion.Subscription) bool 
 func (c *Claims) Claim(ctx context.Context, task string) (busy bool, err error) {
 	c.op.Lock()
 	defer c.op.Unlock()
-	sub, err := c.connected(ctx)
+	err = c.request(ctx, func(sub *companion.Subscription) error {
+		return sub.Claim(ctx, companion.ByPhone, task)
+	})
 	if err != nil {
-		return false, err
-	}
-	if err := sub.Claim(ctx, companion.ByPhone, task); err != nil {
 		if companion.IsCode(err, companion.CodeBusy) {
 			return true, nil
 		}
@@ -145,12 +149,53 @@ func (c *Claims) Release(ctx context.Context) {
 func (c *Claims) StopComputer(ctx context.Context) error {
 	c.op.Lock()
 	defer c.op.Unlock()
+	return c.request(ctx, func(sub *companion.Subscription) error {
+		_, err := sub.StopClaim(ctx)
+		return err
+	})
+}
+
+// request runs send on the subscription the claims go over. When that
+// subscription turns out to have ended (the service restarted, and the
+// core heard it only now), it runs send again on the one Watch opens next,
+// so that the person's Start does not fail for it.
+func (c *Claims) request(ctx context.Context, send func(*companion.Subscription) error) error {
 	sub, err := c.connected(ctx)
 	if err != nil {
 		return err
 	}
-	_, err = sub.StopClaim(ctx)
-	return err
+	err = send(sub)
+	if !errors.Is(err, companion.ErrNotRunning) {
+		return err
+	}
+	sub.Close()
+	if sub, err = c.next(ctx, sub); err != nil {
+		return err
+	}
+	return send(sub)
+}
+
+// next waits a moment for Watch to open a subscription other than old.
+func (c *Claims) next(ctx context.Context, old *companion.Subscription) (*companion.Subscription, error) {
+	deadline := time.NewTimer(connectWait)
+	defer deadline.Stop()
+	tick := time.NewTicker(c.retry / 4)
+	defer tick.Stop()
+	for {
+		c.mu.Lock()
+		sub := c.sub
+		c.mu.Unlock()
+		if sub != nil && sub != old {
+			return sub, nil
+		}
+		select {
+		case <-tick.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-deadline.C:
+			return nil, errNoService
+		}
+	}
 }
 
 // Computer reports a computer's claim: its task, and whether it can be

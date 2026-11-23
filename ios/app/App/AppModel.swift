@@ -14,11 +14,19 @@ final class AppModel: ObservableObject {
     @Published private(set) var state: CoreState?
     @Published private(set) var reason: String?
     /// The VPN that reflects the phone's own connections: Pinky's own
-    /// packet tunnel, or LocalDevVPN in a build without one.
+    /// packet tunnel, or LocalDevVPN in a build without one, on once its
+    /// tunnel is up with Pinky's address or the core reaches the phone.
     @Published private(set) var vpn = VPN.off
+    /// LocalDevVPN's tunnel as the interfaces show it, in a build without a
+    /// tunnel of its own (watchTunnel); .off in the full build.
+    @Published private(set) var localDevVPN = LocalDevVPN.Status.off
     /// A refused start or decide, in words, until the next action.
     @Published var problem: String?
-    @Published private(set) var history: [HistoryTask] = []
+    /// The five latest tasks that ended, for the task screen's Activity.
+    @Published private(set) var recent: [PastTask] = []
+    /// What the model used in the last 30 days, newest first, as the core
+    /// last said (pilot.UsageRow).
+    @Published private(set) var usage: [UsageRow] = []
     @Published private(set) var paired = Pairing.load() != nil
     /// Pairing from this iPhone itself (iOS 27), while it runs.
     @Published private(set) var pairStep = PhonePairing.Step.idle
@@ -43,13 +51,32 @@ final class AppModel: ObservableObject {
     let inApp = false
     #endif
 
+    /// A debug build's canned scenario (Demo): no core, no VPN.
+    #if DEBUG
+    let demo = Demo.scenario != nil
+    #else
+    let demo = false
+    #endif
+
     init() {
+        #if DEBUG
+        if demo {
+            paired = Demo.paired
+            vpn = Demo.vpnOn ? .on : .off
+            if inApp { localDevVPN = Demo.localDevVPN }
+            state = Demo.state
+            Task { await loadRecent() }
+            return
+        }
+        #endif
         #if !NO_TUNNEL
         NotificationCenter.default.addObserver(forName: .NEVPNStatusDidChange, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.vpnChanged() }
         }
         Task { await loadManager() }
         #else
+        checkTunnel()
+        watchTunnel()
         Task { await startInApp() }
         #endif
         listen()
@@ -232,6 +259,41 @@ final class AppModel: ObservableObject {
 
     func disconnect() {}
 
+    /// Looks at the interfaces every two seconds while Pinky is in front,
+    /// where its first screen waits for LocalDevVPN, which the person turns
+    /// on in another app; coming to the front looks at once (phaseChanged),
+    /// and going to the background stops it.
+    private var watch: Task<Void, Never>?
+
+    private func watchTunnel() {
+        guard watch == nil else { return }
+        watch = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard let self else { return }
+                if self.active { self.checkTunnel() }
+            }
+        }
+    }
+
+    private func stopWatchingTunnel() {
+        watch?.cancel()
+        watch = nil
+    }
+
+    /// The VPN is on once LocalDevVPN's tunnel is up with the phone at
+    /// Pinky's address, or the core reached the phone anyway (a tunnel set
+    /// up otherwise that works). A tunnel that just came up has the core
+    /// try again at once rather than after its back-off.
+    private func checkTunnel() {
+        let s = LocalDevVPN.status()
+        if s != localDevVPN { syslog.log("pinky LocalDevVPN: \(String(describing: s), privacy: .public)") }
+        let came = s != localDevVPN && s != .off
+        localDevVPN = s
+        vpn = s == .on || state?.device.ready == true ? .on : .off
+        if came && PinkyCore.isStarted { PinkyRetry() }
+    }
+
     private func startInApp() async {
         guard !PinkyCore.isStarted else { return }
         let p = Pairing.load()
@@ -242,7 +304,7 @@ final class AppModel: ObservableObject {
             return
         }
         PinkyUIActive(active ? 1 : 0)
-        vpn = .on
+        checkTunnel()
         let n = Notifier()
         n.start()
         notifier = n
@@ -252,27 +314,32 @@ final class AppModel: ObservableObject {
 
     /// One request to the core, wherever it runs.
     func call(_ req: [String: Any]) async -> CoreReply {
-        let data = try! JSONSerialization.data(withJSONObject: req)
-        let out: Data
-        if inApp {
-            out = await Task.detached { PinkyCore.call(data: data) }.value
-        } else {
-            #if NO_TUNNEL
-            out = Data()
-            #else
-            guard vpn == .on, let session = manager?.connection as? NETunnelProviderSession else {
-                return CoreReply(ok: false, error: L.reason("vpn_off"), code: "no_device")
-            }
-            out = await withCheckedContinuation { cont in
-                do {
-                    try session.sendProviderMessage(data) { cont.resume(returning: $0 ?? Data()) }
-                } catch {
-                    cont.resume(returning: Data())
-                }
-            }
-            #endif
-        }
+        #if DEBUG
+        if demo { return Demo.reply(req) }
+        #endif
+        guard let out = await send(req) else { return CoreReply(ok: false, error: L.reason("vpn_off"), code: "no_device") }
         return (try? JSONDecoder().decode(CoreReply.self, from: out)) ?? CoreReply(ok: false, error: "no reply from Pinky's core")
+    }
+
+    /// A request's answer as the core wrote it; nil when the VPN that
+    /// holds the core is off.
+    private func send(_ req: [String: Any]) async -> Data? {
+        let data = try! JSONSerialization.data(withJSONObject: req)
+        if inApp {
+            return await Task.detached { PinkyCore.call(data: data) }.value
+        }
+        #if NO_TUNNEL
+        return Data()
+        #else
+        guard vpn == .on, let session = manager?.connection as? NETunnelProviderSession else { return nil }
+        return await withCheckedContinuation { cont in
+            do {
+                try session.sendProviderMessage(data) { cont.resume(returning: $0 ?? Data()) }
+            } catch {
+                cont.resume(returning: Data())
+            }
+        }
+        #endif
     }
 
     // MARK: State
@@ -299,9 +366,17 @@ final class AppModel: ObservableObject {
         let was = state
         state = st
         self.reason = reason
+        #if NO_TUNNEL
+        if !demo { checkTunnel() }
+        #endif
         keepAlive(isBusy)
         updateActivity(st)
-        if was?.agent?.running == true && st.agent?.running != true { Task { await loadHistory() } }
+        if was == nil || (was?.agent?.running == true && st.agent?.running != true) {
+            Task {
+                await loadRecent()
+                await loadUsage()
+            }
+        }
         #if DEBUG
         debugRun(st)
         #endif
@@ -309,9 +384,10 @@ final class AppModel: ObservableObject {
 
     #if DEBUG
     /// A debug build starts a task from launch arguments once the phone is
-    /// ready (README.md): -pinkyTask, and -provider, -model and -baseURL,
-    /// which override the settings for this run only; the key comes in the
-    /// launch environment (PINKY_MODEL_KEY) and stays in memory.
+    /// ready (README.md): -pinkyTask, and -service (or -provider), -model
+    /// and -baseURL, which override the settings for this run only
+    /// (TaskSettings); the key comes in the launch environment
+    /// (PINKY_MODEL_KEY) and stays in memory.
     private var debugTask = UserDefaults.standard.string(forKey: "pinkyTask")
 
     private func debugRun(_ st: CoreState) {
@@ -347,13 +423,20 @@ final class AppModel: ObservableObject {
     /// Tells the core whether Pinky's own app is in front: it refuses input
     /// while it is, so an agent cannot tap Approve or Stop.
     func phaseChanged(_ p: ScenePhase) {
+        if demo { return }
         active = p != .background
         DarwinNote.post(active ? Pinky.uiOnNote : Pinky.uiOffNote)
         if inApp && PinkyCore.isStarted { PinkyUIActive(active ? 1 : 0) }
         keepAlive(isBusy)
+        #if NO_TUNNEL
+        if p == .background { stopWatchingTunnel() }
+        #endif
         if p == .active {
             #if !NO_TUNNEL
             vpnChanged()
+            #else
+            checkTunnel()
+            watchTunnel()
             #endif
             listen()
             if let st = state { updateActivity(st) }
@@ -362,22 +445,87 @@ final class AppModel: ObservableObject {
 
     // MARK: Tasks
 
-    func startTask(_ text: String, key: String? = nil) async {
+    /// Starts a task; `shared` is text or a link to go with it (a
+    /// shortcut's, NewTaskIntent).
+    func startTask(_ text: String, shared: String = "", key: String? = nil) async {
         problem = nil
-        let d = UserDefaults.standard
-        let provider = d.string(forKey: "provider") ?? "anthropic"
-        let key = key ?? Keychain.get(Keychain.keyAccount(provider)) ?? ""
+        let key = key ?? TaskSettings.key(TaskSettings.service) ?? ""
         // iOS starts a Live Activity only for the app in front, and the core
         // takes Pinky off the screen before the agent's first step.
         startActivity(text)
-        let r = await call([
-            "cmd": "start", "task": text, "key": key, "provider": provider,
-            "model": d.string(forKey: "model") ?? "", "base_url": d.string(forKey: "baseURL") ?? "",
-        ])
+        var req = TaskSettings.request
+        req["cmd"] = "start"
+        req["task"] = text
+        req["key"] = key
+        req["max_steps"] = TaskSettings.maxSteps
+        req["max_minutes"] = TaskSettings.maxMinutes
+        req["max_cost"] = TaskSettings.maxCost
+        if !shared.isEmpty { req["shared"] = shared }
+        let r = await call(req)
         if !r.ok {
             endActivities(nil)
             problem = L.refused(r.code, r.error)
         }
+    }
+
+    /// What became of a message to Pinky, for the task screen.
+    enum Sent: Equatable {
+        case ok
+        /// The task ended meanwhile: the text belongs in Continue.
+        case ended
+        /// The model read it already: it can no longer change.
+        case read
+        /// Withdrawn already.
+        case gone
+        /// In words, for the screen.
+        case failed(String)
+    }
+
+    /// Sends the person's message to the running task: the model reads it
+    /// at its next step.
+    func steer(_ text: String) async -> Sent {
+        sent(await call(["cmd": "steer", "text": text]))
+    }
+
+    /// Changes a message the model has not read yet; empty text withdraws it.
+    func editMessage(_ id: String, _ text: String) async -> Sent {
+        sent(await call(["cmd": "steer", "id": id, "text": text]))
+    }
+
+    func withdraw(_ id: String) async -> Sent {
+        sent(await call(["cmd": "withdraw", "id": id]))
+    }
+
+    private func sent(_ r: CoreReply) -> Sent {
+        if r.ok { return .ok }
+        switch r.code {
+        case "not_running": return .ended
+        case "read": return .read
+        case "no_message": return .gone
+        default: return .failed(L.notSent(r.error))
+        }
+    }
+
+    /// Continues the task that ended with the person's new message (empty
+    /// sends the messages left unread); its limits count anew. The key goes
+    /// with it as with start. nil when the core took it, else why not.
+    func continueTask(_ text: String) async -> String? {
+        problem = nil
+        // The key of the service the task runs on, which Settings may have
+        // changed since.
+        // A core of before names only the API, the name keys had then.
+        let a = state?.agent
+        let name = a?.key_name ?? a?.provider ?? TaskSettings.service.keyName
+        var key = Keychain.get(Keychain.keyAccount(name)) ?? ""
+        #if DEBUG
+        // A task a debug build started from launch arguments has its key there.
+        if key.isEmpty { key = ProcessInfo.processInfo.environment["PINKY_MODEL_KEY"] ?? "" }
+        #endif
+        startActivity(state?.agent?.task ?? text)
+        let r = await call(["cmd": "continue", "text": text, "key": key])
+        if r.ok { return nil }
+        endActivities(nil)
+        return L.continueRefused(r.code, r.error)
     }
 
     func stop() async {
@@ -409,9 +557,98 @@ final class AppModel: ObservableObject {
         if !r.ok { problem = L.refused(r.code, r.error) }
     }
 
-    func loadHistory(search: String = "") async {
-        let r = await call(["cmd": "history", "search": search, "limit": 100])
-        if r.ok { history = r.history ?? [] }
+    // MARK: The model
+
+    /// What a check came to: the model's answer, or why the core could
+    /// not check (the VPN is off, say).
+    enum CheckOutcome: Equatable { case result(CheckResult), failed(String) }
+
+    private struct CheckReply: Decodable {
+        var ok: Bool
+        var error: String?
+        var code: String?
+        var check: CheckResult?
+    }
+
+    private struct UsageReply: Decodable {
+        var ok: Bool
+        var usage: [UsageRow]?
+    }
+
+    /// Checks the model of the settings with one tiny request
+    /// (pilot.Check), with the service's key; the core does not keep it.
+    /// Takes up to a minute.
+    func check() async -> CheckOutcome {
+        var req = TaskSettings.request
+        req["cmd"] = "check"
+        req["key"] = TaskSettings.key(TaskSettings.service) ?? ""
+        #if DEBUG
+        if demo {
+            try? await Task.sleep(for: .seconds(1))
+            return .result(CheckResult(ok: true, ms: 1240))
+        }
+        #endif
+        guard let out = await send(req) else { return .failed(L.reason("vpn_off")) }
+        guard let r = try? JSONDecoder().decode(CheckReply.self, from: out) else { return .failed("no reply from Pinky's core") }
+        if r.ok, let c = r.check { return .result(c) }
+        return .failed(L.refused(r.code, r.error))
+    }
+
+    /// Reads what the model used in the last 30 days.
+    func loadUsage() async {
+        #if DEBUG
+        if demo {
+            usage = Demo.usage
+            return
+        }
+        #endif
+        guard let out = await send(["cmd": "usage", "since": UsageRow.day(back: 29)]),
+              let r = try? JSONDecoder().decode(UsageReply.self, from: out), r.ok
+        else { return }
+        usage = r.usage ?? []
+    }
+
+    // MARK: Memory
+
+    /// A notes command: the notes after it, or why the core said no.
+    func memory(_ req: [String: Any]) async -> Result<[Memory], MemoryRefusal> {
+        let r = await call(req)
+        if r.ok { return .success(r.memories ?? []) }
+        return .failure(MemoryRefusal(code: r.code))
+    }
+
+    struct MemoryRefusal: Error { var code: String? }
+
+    /// Keeps or drops the note the task suggested at index i; nil when it
+    /// went through, else why not.
+    func decideNote(_ i: Int, keep: Bool) async -> String? {
+        let r = await call(["cmd": keep ? "keep" : "drop", "index": i])
+        return r.ok ? nil : L.memoryError(r.code)
+    }
+
+    // MARK: Activity
+
+    func loadRecent() async {
+        if let page = await history(before: nil, limit: 5) { recent = page.tasks }
+    }
+
+    /// A page of Activity, newest first: the tasks that ended before a
+    /// time (Unix ms), and whether there are more; nil when the core did
+    /// not answer.
+    func history(before: Int64?, limit: Int = 20) async -> (tasks: [PastTask], more: Bool)? {
+        let r = await call(["cmd": "history", "before_ms": before ?? 0, "limit": limit])
+        guard r.ok else { return nil }
+        return (r.history ?? [], r.more ?? false)
+    }
+
+    /// One task of Activity with its steps; gone when it is no longer
+    /// there.
+    enum PastResult { case task(PastTask), gone, failed }
+
+    func pastTask(_ id: String) async -> PastResult {
+        let r = await call(["cmd": "history", "id": id])
+        if r.ok, let t = r.history?.first { return .task(t) }
+        return r.code == "gone" ? .gone : .failed
     }
 
     // MARK: Live Activity
@@ -432,7 +669,7 @@ final class AppModel: ObservableObject {
         let acts = Activity<PinkyActivityAttributes>.activities
         guard !acts.isEmpty else { return }
         guard let a = st.agent, a.running else {
-            endActivities(st.agent.map { L.ended($0.end ?? "") })
+            endActivities(st.agent.map { L.end($0).title })
             return
         }
         let waiting = st.needs.first

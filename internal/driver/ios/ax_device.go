@@ -75,7 +75,7 @@ func (a *AXDevice) Info() driver.Info { return a.d.info }
 
 // Observe implements driver.Device: the inspector's walk, placed by OCR.
 func (a *AXDevice) Observe(ctx context.Context, opt driver.ObserveOptions) (*screen.Screen, error) {
-	s, _, err := a.d.observeInspector(ctx, opt, ObserveStats{})
+	s, _, err := a.d.observeInspector(ctx, opt, ObserveStats{}, true, screen.App{})
 	return s, err
 }
 
@@ -86,7 +86,7 @@ func (a *AXDevice) Screenshot(ctx context.Context) (image.Image, error) {
 
 // errNeedsHelper explains what this path cannot do.
 func errNeedsHelper(what string) error {
-	return fmt.Errorf("%s needs Pinky for iPhone on iPhones below iOS 27 (docs/notes/ios.md): %w", what, driver.ErrUnsupported)
+	return fmt.Errorf("%s needs Pinky on the iPhone on iPhones below iOS 27 (docs/notes/ios.md): %w", what, driver.ErrUnsupported)
 }
 
 // Tap implements driver.Device.

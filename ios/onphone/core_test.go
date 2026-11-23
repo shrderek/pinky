@@ -244,14 +244,18 @@ func newHarnessLog(t *testing.T, log *slog.Logger) *harness {
 }
 
 type out struct {
-	OK      bool              `json:"ok"`
-	Error   string            `json:"error"`
-	Code    string            `json:"code"`
-	Rev     uint64            `json:"rev"`
-	State   *standalone.State `json:"state"`
-	Reason  string            `json:"reason"`
-	History []HistoryTask     `json:"history"`
-	Info    *Info             `json:"info"`
+	OK      bool                  `json:"ok"`
+	Error   string                `json:"error"`
+	Code    string                `json:"code"`
+	Rev     uint64                `json:"rev"`
+	State   *standalone.State     `json:"state"`
+	Reason  string                `json:"reason"`
+	History []standalone.PastTask `json:"history"`
+	More    bool                  `json:"more"`
+	Info    *Info                 `json:"info"`
+	ID      string                `json:"id"`
+
+	Memories []standalone.MemoryState `json:"memories"`
 }
 
 func (h *harness) do(t *testing.T, req map[string]any) out {
@@ -294,7 +298,7 @@ func TestApprovalInPinkysApp(t *testing.T) {
 	}{
 		{map[string]any{"cmd": "start", "task": "Order lunch", "base_url": h.url}, "no_key"},
 		{map[string]any{"cmd": "start", "task": " ", "key": "sk-test"}, "no_task"},
-		{map[string]any{"cmd": "start", "task": "Order lunch", "key": "sk-test", "provider": "openai"}, "no_model"},
+		{map[string]any{"cmd": "start", "task": "Order lunch", "key": "sk-test", "service": "openai-compatible"}, "no_model"},
 		{map[string]any{"cmd": "decide", "need": "nothing", "decision": "allow_once"}, "gone"},
 	} {
 		if o := h.do(t, tc.req); o.OK || o.Code != tc.code {
@@ -360,8 +364,16 @@ func TestApprovalInPinkysApp(t *testing.T) {
 	}
 
 	o := h.do(t, map[string]any{"cmd": "history"})
-	if !o.OK || len(o.History) != 1 || o.History[0].Title != "Order lunch" || len(o.History[0].Steps) == 0 {
+	if !o.OK || len(o.History) != 1 || o.History[0].Title != "Order lunch" || o.History[0].Outcome != "done" ||
+		o.History[0].Agent == nil || o.History[0].Agent.Summary != "Ordered." || o.More {
 		t.Fatalf("history: %+v", o)
+	}
+	o = h.do(t, map[string]any{"cmd": "history", "id": o.History[0].ID})
+	if !o.OK || len(o.History) != 1 || len(o.History[0].Steps) == 0 {
+		t.Fatalf("a task of the history: %+v", o)
+	}
+	if o := h.do(t, map[string]any{"cmd": "history", "id": "nope"}); o.OK || o.Code != "gone" {
+		t.Fatalf("a task the history does not have: %+v", o)
 	}
 	if o := h.do(t, map[string]any{"cmd": "info"}); !o.OK || o.Info == nil || !o.Info.Connected {
 		t.Fatalf("info: %+v", o)
@@ -464,5 +476,71 @@ func TestWait(t *testing.T) {
 	}
 	if o := h.do(t, map[string]any{"cmd": "state"}); o.Reason != ReasonVPNOff {
 		t.Fatalf("reason: %+v", o)
+	}
+}
+
+// The person's messages: steer while the task runs, then continue, which
+// leaves Pinky's app first as start does.
+func TestSteerAndContinue(t *testing.T) {
+	h := newHarness(t)
+	asked, goOn := make(chan struct{}), make(chan struct{})
+	var uiAtContinue bool
+	h.api.turns = []func(string, *http.Request) map[string]any{
+		func(string, *http.Request) map[string]any {
+			close(asked)
+			<-goOn
+			return call("t1", "phone_observe", nil)
+		},
+		func(string, *http.Request) map[string]any {
+			return call("t2", "finish", map[string]any{"outcome": "done", "summary": "Looked."})
+		},
+		func(string, *http.Request) map[string]any {
+			uiAtContinue = h.core.gate.uiActive()
+			return call("t3", "finish", map[string]any{"outcome": "done", "summary": "Looked again."})
+		},
+	}
+	if o := h.do(t, map[string]any{"cmd": "steer", "text": "Hi"}); o.OK || o.Code != standalone.CodeNotRunning {
+		t.Fatalf("steer with no task: %+v", o)
+	}
+	if o := h.do(t, map[string]any{"cmd": "start", "task": "Look", "key": "sk-test", "base_url": h.url,
+		"model": "fake"}); !o.OK {
+		t.Fatalf("start: %+v", o)
+	}
+	<-asked
+	o := h.do(t, map[string]any{"cmd": "steer", "text": "Look at the top"})
+	if !o.OK || o.ID == "" {
+		t.Fatalf("steer: %+v", o)
+	}
+	if o := h.do(t, map[string]any{"cmd": "steer", "id": o.ID, "text": "Look at the bottom"}); !o.OK {
+		t.Fatalf("edit: %+v", o)
+	}
+	extra := h.do(t, map[string]any{"cmd": "steer", "text": "Never mind"}).ID
+	if o := h.do(t, map[string]any{"cmd": "withdraw", "id": extra}); !o.OK {
+		t.Fatalf("withdraw: %+v", o)
+	}
+	h.until(t, "the message waits", func(s standalone.State) bool {
+		return s.Agent != nil && len(s.Agent.Pending) == 1 && s.Agent.Pending[0].Text == "Look at the bottom"
+	})
+	close(goOn)
+	st := h.until(t, "the end", func(s standalone.State) bool { return s.Agent != nil && !s.Agent.Running })
+	if !st.Agent.Continuable || len(st.Agent.Pending) != 0 {
+		t.Fatalf("agent: %+v", st.Agent)
+	}
+
+	h.person.openPinky(t)
+	if o := h.do(t, map[string]any{"cmd": "continue", "text": "Again"}); o.OK || o.Code != "no_key" {
+		t.Fatalf("continue without a key: %+v", o)
+	}
+	if o := h.do(t, map[string]any{"cmd": "continue", "text": "Again", "key": "sk-test"}); !o.OK {
+		t.Fatalf("continue: %+v", o)
+	}
+	st = h.until(t, "the second end", func(s standalone.State) bool {
+		return s.Agent != nil && !s.Agent.Running && s.Agent.Continues == 1
+	})
+	if st.Agent.Summary != "Looked again." {
+		t.Fatalf("agent: %+v", st.Agent)
+	}
+	if uiAtContinue {
+		t.Fatal("the agent went on while Pinky's app was in front")
 	}
 }

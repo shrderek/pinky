@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -51,6 +52,7 @@ func (g *Gateway) Devices() []DeviceView {
 		}
 		st, line := g.statusLocked(d, open)
 		v := DeviceView{Info: info, Status: st, StatusLine: line, Paused: paused, Streaming: g.capturingLocked(d)}
+		v.ScreenOff = st == DeviceIdle && d.screenOff
 		if d.online && d.dev != nil {
 			v.Features = featuresOf(d.dev)
 			// Over CoreDevice, the person's Rotate and pinch move to the
@@ -173,6 +175,9 @@ func (g *Gateway) statusLocked(d *device, open []approval.Info) (DeviceStatus, s
 		}
 		return DeviceWorking, line
 	}
+	if d.screenOff {
+		return DeviceIdle, "Screen off"
+	}
 	return DeviceIdle, "Idle"
 }
 
@@ -190,21 +195,31 @@ func (g *Gateway) Tasks() []TaskView {
 	var out []TaskView
 	for _, d := range g.sortedDevicesLocked() {
 		if d.lease != nil {
-			out = append(out, taskView(d.lease.task))
+			out = append(out, g.taskViewLocked(d.lease.task))
 		}
 	}
 	cutoff := time.Now().Add(-10 * time.Minute)
 	for i := len(g.ended) - 1; i >= 0; i-- {
 		if t := g.ended[i]; t.ended.After(cutoff) {
-			out = append(out, taskView(t))
+			out = append(out, g.taskViewLocked(t))
 		}
 	}
 	return out
 }
 
-func taskView(t *task) TaskView {
-	return TaskView{ID: t.id, DeviceID: t.deviceID, DeviceName: t.deviceName, Agent: t.agent, Title: t.title,
+// taskViewLocked is t as a card, with the access its agent has now while
+// it runs. The caller holds g.mu.
+func (g *Gateway) taskViewLocked(t *task) TaskView {
+	v := TaskView{ID: t.id, DeviceID: t.deviceID, DeviceName: t.deviceName, Agent: t.agent, Title: t.title,
 		State: t.state, Started: t.started, Ended: t.ended, Steps: append([]StepView(nil), t.steps...), ReadOnly: t.readOnly}
+	if t.ended.IsZero() && t.agent != "" {
+		scope := g.opt.DefaultScope
+		if st, ok := g.agents[t.agent]; ok {
+			scope = st.scope
+		}
+		v.AgentReadOnly = scope.Mode == ScopeReadOnly
+	}
+	return v
 }
 
 // Needs implements API.
@@ -219,7 +234,7 @@ func (g *Gateway) Needs() []NeedView {
 			App: info.App, Agent: info.Agent, TaskID: info.TaskID, Title: info.Title, Detail: info.Detail, Rule: info.Rule,
 			Created: info.Created, Deadline: info.Deadline, Screenshot: info.Screenshot, Target: info.Target,
 			Point: info.Point, To: info.To, Point2: info.Point2, To2: info.To2, Path: info.Path, AlwaysAllow: g.canAlwaysAllow(info), AllowTask: canAllowTask(info),
-			Unblock: isUnblock(info), ReadOnly: askedReadOnly(info)})
+			Unblock: isUnblock(info), ReadOnly: askedReadOnly(info), Apps: askedApps(info)})
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -248,18 +263,32 @@ func (g *Gateway) Needs() []NeedView {
 }
 
 // setupNeedLocked is the Needs you card of a task whose phone waits for
-// the person to do a step on the phone itself: for now the passcode iOS
-// asks before the WebDriverAgent helper may control the phone, a prompt
-// that goes away by itself unless someone sees it in time. The caller
-// holds g.mu.
+// a step only the person can do, which Pinky shows (and the app notifies)
+// whether or not the agent hands over: the passcode iOS asks on the phone
+// before the WebDriverAgent helper may control it, a prompt that goes away
+// by itself unless someone sees it in time; and a phone the computer's
+// device service lost on Wi-Fi, which comes back only when someone at the
+// computer restarts the service with an administrator's password. The
+// caller holds g.mu.
 func setupNeedLocked(d *device) (NeedView, bool) {
 	l := d.lease
-	if l == nil || l.ended || !waitingLocked(d) || d.info.Setup != driver.SetupPasscode {
+	if l == nil || l.ended || !waitingLocked(d) {
+		return NeedView{}, false
+	}
+	switch d.info.Setup {
+	case driver.SetupPasscode:
+	case driver.SetupDeviceService:
+		return NeedView{ID: setupNeedPrefix + d.id, Kind: NeedSetup, DeviceID: d.id, DeviceName: d.name(),
+			Agent: l.session.agent.Name, TaskID: l.task.id, Title: "Restart the device service for " + d.name(),
+			Detail: fmt.Sprintf("This computer's device service lost the phone on Wi-Fi, and only someone at the computer can restart it. %s is waiting · %s",
+				l.session.agent.Name, l.task.title),
+			Created: time.Now()}, true
+	default:
 		return NeedView{}, false
 	}
 	return NeedView{ID: setupNeedPrefix + d.id, Kind: NeedSetup, DeviceID: d.id, DeviceName: d.name(),
 		Agent: l.session.agent.Name, TaskID: l.task.id, Title: "Enter the passcode on " + d.name(),
-		Detail: fmt.Sprintf("iOS asks for it on the phone before Pinky for iPhone can control it, and stops asking after a while. %s is waiting · %s",
+		Detail: fmt.Sprintf("iOS asks for it on the phone before Pinky on the iPhone can control it, and stops asking after a while. %s is waiting · %s",
 			l.session.agent.Name, l.task.title),
 		Created: time.Now()}, true
 }
@@ -315,7 +344,7 @@ func (g *Gateway) memoryHistory(q HistoryQuery) []TaskView {
 		if search != "" && !strings.Contains(strings.ToLower(t.title+" "+t.agent+" "+t.deviceName), search) {
 			continue
 		}
-		out = append(out, taskView(t))
+		out = append(out, g.taskViewLocked(t))
 	}
 	return out
 }
@@ -410,7 +439,7 @@ func canAllowTask(info approval.Info) bool {
 	if _, ok := info.Data.(*appAsk); ok {
 		return true
 	}
-	return info.Rule == filesRule || info.Rule == policy.RuleAppLogs || info.Rule == settingsRule
+	return info.Rule == filesRule || info.Rule == policy.RuleAppLogs || info.Rule == settingsRule || info.Rule == RuleTraffic
 }
 
 func (g *Gateway) decide(id string, d approval.Decision, note string) error {
@@ -447,9 +476,12 @@ func (g *Gateway) TakeOver(deviceID string) error {
 // HandBack, across leases.
 func (g *Gateway) takeOver(d *device, byInput bool) {
 	g.mu.Lock()
-	if l := d.lease; byInput && l != nil && l.bg != nil {
+	if l := d.lease; byInput && l != nil && l.background() {
 		// The person uses the phone's own screen; the agent works on its
-		// background display and goes on.
+		// background display and goes on, also while that display is still
+		// opening or opens again after the phone dropped. Should it not
+		// open, the task waits for a person who used the screen lately
+		// (readyScreen).
 		d.personAt = time.Now()
 		g.mu.Unlock()
 		return
@@ -465,6 +497,7 @@ func (g *Gateway) takeOver(d *device, byInput bool) {
 	changed := !d.person
 	if changed {
 		d.person = true
+		g.quietLocked(d, quietPerson, true)
 		g.noteWorkLocked(d)
 		if l != nil {
 			l.tookOverSeen = false
@@ -505,6 +538,11 @@ func (g *Gateway) HandBack(deviceID, note string) error {
 	}
 	g.mu.Lock()
 	d.person, d.personInput = false, false
+	// The person may have used the phone itself, which an iPhone does not
+	// report: what they left in front is not an app that came by itself
+	// (appswitch.go).
+	g.inputLocked(d)
+	g.quietLocked(d, quietPerson|quietHandoff, false)
 	g.noteWorkLocked(d)
 	l := d.lease
 	if l == nil {
@@ -841,6 +879,56 @@ func (g *Gateway) WipeHistory(ctx context.Context) error {
 			// Running tasks are written again so they keep showing up.
 			g.recordTaskLocked(d.lease.task)
 		}
+	}
+	g.mu.Unlock()
+	g.emit(Event{Kind: EventTasks})
+	return nil
+}
+
+// ErrTaskRunning answers DeleteTasks for a task that is still running, or
+// whose screen recording is still being written.
+var ErrTaskRunning = errors.New("the task is still running")
+
+// DeleteTasks deletes finished tasks from history, with their steps,
+// approvals, screenshots and screen recordings, as the person asks from a
+// task's detail in Activity. It deletes nothing and returns ErrTaskRunning
+// when one of them still runs. A task history no longer has is no error.
+func (g *Gateway) DeleteTasks(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if g.store != nil {
+		g.Flush() // what is being written about them first
+	}
+	g.mu.Lock()
+	keep := g.liveTasksLocked()
+	g.mu.Unlock()
+	for _, id := range ids {
+		if slices.Contains(keep, id) {
+			return ErrTaskRunning
+		}
+	}
+	if g.store != nil {
+		n, err := g.store.DeleteTasks(ctx, ids, keep)
+		if err != nil {
+			return err
+		}
+		g.log.Info("delete tasks", "tasks", n.Tasks, "steps", n.Steps, "screenshots", n.Media,
+			"recordings", n.Recordings, "sessions", n.Sessions)
+	}
+	g.mu.Lock()
+	kept := g.ended[:0]
+	for _, t := range g.ended {
+		if !slices.Contains(ids, t.id) {
+			kept = append(kept, t)
+		}
+	}
+	clear(g.ended[len(kept):])
+	g.ended = kept
+	// A kept screenshot may be one the deleted tasks alone showed, whose
+	// media is gone now; the next step takes a new one.
+	for _, d := range g.devices {
+		d.kept = nil
 	}
 	g.mu.Unlock()
 	g.emit(Event{Kind: EventTasks})

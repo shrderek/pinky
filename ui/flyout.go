@@ -81,8 +81,8 @@ func (a *app) updateTray() {
 // fits one need and three phones.
 func (a *app) flyoutHeight() int {
 	h := 6 + 8 // padding
-	if len(a.needs) > 0 {
-		h += 26 + 36*min(len(a.needs), 4)
+	if n := min(len(a.needs), 4); n > 0 {
+		h += 26 + 36*n + flyNeedGap*(n-1)
 	}
 	h += 26 + 4 + 36*max(1, len(a.devices))
 	h += 13 + 36 // Open Pinky
@@ -147,7 +147,20 @@ func (a *app) flyoutView(c *mg.Context) {
 					break
 				}
 				n := n
-				row := flyRow(c.Key("n-" + n.ID)).Background(needTint)
+				if i > 0 {
+					mg.Box(c).Height(flyNeedGap).Shrink(0)
+				}
+				row := flyRow(c.Key("n-" + n.ID))
+				// The tint, darker under the pointer, as other rows'
+				// fills are.
+				switch {
+				case row.Pressed():
+					row.Background(needTint.Mix(p.amberDot, 0.22))
+				case row.Hovered():
+					row.Background(needTint.Mix(p.amberDot, 0.12))
+				default:
+					row.Background(needTint)
+				}
 				if row.Clicked() {
 					if a.flyout != nil {
 						a.flyout.Close()
@@ -214,22 +227,32 @@ func (a *app) flyoutView(c *mg.Context) {
 		}
 		stop.Children(func() {
 			mg.Text(c, locales.FlyoutStopAll()).TextColor(p.red).Grow(1)
-			mg.Text(c, shortcutLabel()).FontSize(fsSmall).TextColor(p.ink3)
+			mg.Text(c, a.shortcutLabel()).FontSize(fsSmall).TextColor(p.ink3)
 		})
 	})
 }
 
+// flyNeedGap parts the tinted rows of what waits, which would otherwise
+// read as one block.
+const flyNeedGap = 2
+
 func flyRow(c *mg.Context) mg.Element {
 	p := pal(c)
-	row := mg.ButtonBase(c).MinHeight(36).Padding(6, 10).Radius(8).Gap(10).AlignItems(mg.Center).Justify(mg.Start).FillWidth()
-	if row.Hovered() {
-		if c.Vibrancy() {
+	row := mg.ButtonBase(c).MinHeight(36).Padding(6, 10).Radius(rControl).Gap(10).AlignItems(mg.Center).Justify(mg.Start).FillWidth()
+	pressed := row.Pressed()
+	if row.Hovered() || pressed {
+		switch {
+		case c.Vibrancy() && pressed:
+			row.Background(flyTint(p, p.ink, 0.11, 0.15))
+		case c.Vibrancy():
 			row.Background(flyTint(p, p.ink, 0.07, 0.1))
-		} else {
+		case pressed:
+			row.Background(p.sel)
+		default:
 			row.Background(p.bg3)
 		}
 	}
-	return row
+	return fillFade(row)
 }
 
 // flyoutRadius rounds the flyout's corners on macOS, as its menu bar
@@ -257,6 +280,9 @@ func needShort(n gateway.NeedView) string {
 	case gateway.NeedUnlock:
 		return locales.FlyoutLocked()
 	case gateway.NeedSetup:
+		if lostSetup(n) {
+			return locales.FlyoutLost()
+		}
 		return locales.FlyoutPasscode()
 	}
 	return t

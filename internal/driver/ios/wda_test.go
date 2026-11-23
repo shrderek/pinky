@@ -3,6 +3,7 @@ package ios
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -357,23 +358,9 @@ func TestMJPEGReader(t *testing.T) {
 	}
 }
 
-func TestAVCCToAnnexB(t *testing.T) {
-	avcc := []byte{0, 0, 0, 2, 0x65, 0xAA, 0, 0, 0, 3, 0x41, 0xBB, 0xCC}
-	got := avccToAnnexB(avcc, 4)
-	want := []byte{0, 0, 0, 1, 0x65, 0xAA, 0, 0, 0, 1, 0x41, 0xBB, 0xCC}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("annex b % x", got)
-	}
-	if !hasIDR(got) || hasIDR(want[6:]) {
-		t.Fatal("IDR detection")
-	}
-	if len(avccToAnnexB([]byte{0, 0, 0, 9, 1}, 4)) != 0 {
-		t.Fatal("a truncated unit must be dropped")
-	}
-}
-
 func TestToNV12(t *testing.T) {
-	// JPEG's 4:2:0 pictures copy straight; odd sizes are cropped to even.
+	// JPEG's 4:2:0 samples are full range and are scaled to video range as
+	// they are copied; odd sizes are cropped to even.
 	img, err := jpeg.Decode(bytes.NewReader(jpegBytes(t, 33, 65, color.RGBA{200, 30, 60, 255})))
 	if err != nil {
 		t.Fatal(err)
@@ -383,8 +370,19 @@ func TestToNV12(t *testing.T) {
 		t.Fatalf("size %dx%d, planes %d %d", w, h, len(y), len(uv))
 	}
 	yc := img.(*image.YCbCr)
-	if y[0] != yc.Y[0] || uv[0] != yc.Cb[0] || uv[1] != yc.Cr[0] {
-		t.Fatalf("planes not copied: %d %d %d", y[0], uv[0], uv[1])
+	if y[0] != fullToVideoY[yc.Y[0]] || uv[0] != fullToVideoC[yc.Cb[0]] || uv[1] != fullToVideoC[yc.Cr[0]] {
+		t.Fatalf("planes not scaled to video range: %d %d %d", y[0], uv[0], uv[1])
+	}
+	// Both planes must stay inside the video range, whatever the picture is.
+	for _, v := range y {
+		if v < 16 || v > 235 {
+			t.Fatalf("luma %d outside video range", v)
+		}
+	}
+	for _, v := range uv {
+		if v < 16 || v > 240 {
+			t.Fatalf("chroma %d outside video range", v)
+		}
 	}
 	// RGBA goes through BT.601: white is Y 235, gray chroma.
 	rgba := image.NewRGBA(image.Rect(0, 0, 4, 4))
@@ -394,6 +392,26 @@ func TestToNV12(t *testing.T) {
 	y, uv, _, _ = toNV12(rgba)
 	if y[0] < 233 || y[0] > 236 || uv[0] < 127 || uv[0] > 129 || uv[1] < 127 || uv[1] > 129 {
 		t.Fatalf("white: Y %d, Cb %d, Cr %d", y[0], uv[0], uv[1])
+	}
+}
+
+// TestToNV12RoundTrip checks the property that makes the scaling safe to
+// apply to every picture rather than to one: a decoder that reads NV12 the
+// standard way gets back the sample the JPEG carried, for every value from
+// black to white. No picture is brightened or darkened by the conversion, so
+// none is treated specially.
+func TestToNV12RoundTrip(t *testing.T) {
+	for v := 0; v < 256; v++ {
+		if got := (int(fullToVideoY[v]) - 16) * 255 / 219; got < v-2 || got > v+2 {
+			t.Fatalf("luma %d came back as %d", v, got)
+		}
+		c := fullToVideoC[v]
+		if c < 16 || c > 240 {
+			t.Fatalf("chroma %d outside video range: %d", v, c)
+		}
+		if got := 128 + (int(c)-128)*255/224; got < v-2 || got > v+2 {
+			t.Fatalf("chroma %d came back as %d", v, got)
+		}
 	}
 }
 
@@ -408,7 +426,13 @@ type fakeWDA struct {
 	// For reads.
 	app         string        // /wda/activeAppInfo's value
 	locked      bool          // /wda/locked
+	homeRefused string        // /wda/homescreen fails with this message; "" answers OK
 	sourceDelay time.Duration // before /source answers; set before the first request
+	// sourceHold, when set before the request, holds /source until it is
+	// closed or the request ends: a tree the phone takes forever to build.
+	sourceHold chan struct{}
+	sourcesIn  int    // /source requests received, counted before they are held
+	png        []byte // /screenshot's picture; nil fails it
 	shots       int           // /screenshot requests
 	shotAt      time.Time     // the last one
 	sourceAt    time.Time     // when /source last answered
@@ -416,8 +440,20 @@ type fakeWDA struct {
 }
 
 func (f *fakeWDA) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if strings.HasSuffix(r.URL.Path, "/source") && f.sourceDelay > 0 {
-		time.Sleep(f.sourceDelay) // a phone's tree takes long; other requests go on
+	if strings.HasSuffix(r.URL.Path, "/source") {
+		f.mu.Lock()
+		f.sourcesIn++
+		hold := f.sourceHold
+		f.mu.Unlock()
+		if hold != nil {
+			select {
+			case <-hold:
+			case <-r.Context().Done():
+			}
+		}
+		if f.sourceDelay > 0 {
+			time.Sleep(f.sourceDelay) // a phone's tree takes long; other requests go on
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -453,12 +489,19 @@ func (f *fakeWDA) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "POST /session":
 		f.sessions++
 		fmt.Fprintf(w, `{"value":{"sessionId":"s%d","capabilities":{}},"sessionId":"s%d"}`, f.sessions, f.sessions)
-	case "POST /appium/settings", "POST /actions", "POST /wda/keys", "POST /element/E1/clear", "POST /url":
+	case "POST /appium/settings", "POST /actions", "POST /wda/keys", "POST /wda/performIoHidEvent", "POST /element/E1/clear", "POST /url":
 		fmt.Fprint(w, `{"value":null}`)
 	case "GET /wda/activeAppInfo":
 		fmt.Fprintf(w, `{"value":%s}`, f.app)
 	case "GET /wda/locked":
 		fmt.Fprintf(w, `{"value":%v}`, f.locked)
+	case "POST /wda/homescreen":
+		if f.homeRefused != "" {
+			w.WriteHeader(500)
+			fmt.Fprintf(w, `{"value":{"error":"unknown error","message":%q}}`, f.homeRefused)
+			return
+		}
+		fmt.Fprint(w, `{"value":null}`)
 	case "GET /source":
 		f.sourceAt = time.Now()
 		fmt.Fprint(w, `{"value":{"type":"XCUIElementTypeApplication","label":"App","rect":{"x":0,"y":0,"width":100,"height":200},"isVisible":"1",`+
@@ -466,6 +509,10 @@ func (f *fakeWDA) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "GET /screenshot":
 		f.shots++
 		f.shotAt = time.Now()
+		if f.png != nil {
+			fmt.Fprintf(w, `{"value":%q}`, base64.StdEncoding.EncodeToString(f.png))
+			return
+		}
 		w.WriteHeader(500) // the read goes on without OCR's text
 		fmt.Fprint(w, `{"value":{"error":"unknown error","message":"no picture in tests"}}`)
 	case "GET /element/active":
@@ -496,6 +543,15 @@ func TestWDAClient(t *testing.T) {
 	}
 	if f.sessions != 1 || len(f.bodies["POST /appium/settings"]) != 1 {
 		t.Fatalf("sessions %d, settings %v", f.sessions, f.bodies["POST /appium/settings"])
+	}
+	// Typing goes at Pinky's speed, not XCTest's default of 60 keys a
+	// second (GitHub issue #101).
+	var set struct {
+		Settings map[string]any `json:"settings"`
+	}
+	json.Unmarshal([]byte(f.bodies["POST /appium/settings"][0]), &set)
+	if set.Settings["maxTypingFrequency"] != float64(wdaTypingFrequency) {
+		t.Fatalf("maxTypingFrequency %v, want %d", set.Settings["maxTypingFrequency"], wdaTypingFrequency)
 	}
 	var acts struct {
 		Actions []struct {
@@ -533,6 +589,64 @@ func TestWDAClient(t *testing.T) {
 	}
 	if err := c.do(ctx, c.hc, http.MethodGet, "/element/active?none", nil, nil); !errors.As(err, &we) || we.Code != "no such element" {
 		t.Fatalf("no such element: %v", err)
+	}
+}
+
+func TestWDAKeyUsesHIDForNavKeys(t *testing.T) {
+	f := &fakeWDA{}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	d := &WDADevice{c: newWDAURL(srv.URL, ""), scale: 1}
+	ctx := context.Background()
+	// An arrow key has no character, so it goes as a HID usage on the
+	// keyboard page, the way the iOS 27 path presses it.
+	if err := d.Key(ctx, driver.KeyDpadLeft); err != nil {
+		t.Fatal(err)
+	}
+	body := f.bodies["POST /wda/performIoHidEvent"]
+	if len(body) != 1 {
+		t.Fatalf("hid events %v", body)
+	}
+	var ev struct {
+		Page     int     `json:"page"`
+		Usage    int     `json:"usage"`
+		Duration float64 `json:"duration"`
+	}
+	if err := json.Unmarshal([]byte(body[0]), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Page != keyboardPage || ev.Usage != keyLeft || ev.Duration != wdaKeyHold.Seconds() {
+		t.Fatalf("event %+v", ev)
+	}
+	// Keys a character names still go as text, not as usages.
+	if err := d.Key(ctx, driver.KeyTab); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.bodies["POST /wda/keys"]) != 1 || len(f.bodies["POST /wda/performIoHidEvent"]) != 1 {
+		t.Fatalf("keys %v, hid events %v", f.bodies["POST /wda/keys"], f.bodies["POST /wda/performIoHidEvent"])
+	}
+	if err := d.Key(ctx, driver.Key("nothing")); !errors.Is(err, driver.ErrUnsupported) {
+		t.Fatalf("unknown key: %v", err)
+	}
+}
+
+// A locked phone refuses to open SpringBoard, which is the wake rather than
+// a failure: the Home key must not surface it.
+func TestWDAHomeKeyOnLockedPhone(t *testing.T) {
+	f := &fakeWDA{homeRefused: `Error Domain=FBSOpenApplicationServiceErrorDomain Code=1 "The request to open "com.apple.springboard" failed." UserInfo={BSErrorCodeDescription=Locked, NSLocalizedFailureReason=Unable to launch (null) because the device was not, or could not be, unlocked.}`}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	d := &WDADevice{c: newWDAURL(srv.URL, ""), scale: 1}
+	ctx := context.Background()
+	if err := d.Key(ctx, driver.KeyHome); err != nil {
+		t.Fatalf("locked: %v", err)
+	}
+	// A failure to open SpringBoard for any other reason is still a failure.
+	f.mu.Lock()
+	f.homeRefused = `Error Domain=FBSOpenApplicationServiceErrorDomain Code=1 "The request to open "com.apple.springboard" failed."`
+	f.mu.Unlock()
+	if err := d.Key(ctx, driver.KeyHome); err == nil {
+		t.Fatal("not locked: no error")
 	}
 }
 
@@ -635,5 +749,32 @@ func TestBackButtonSplitView(t *testing.T) {
 	root.Children[1].Children[0].Name, root.Children[1].Children[0].Identifier = nil, nil
 	if p, ok = backButton(&root, 2); ok {
 		t.Fatalf("leading button %v", p)
+	}
+}
+
+// Opening an iPhone loads the OCR models in the background: an agent's
+// first read comes with OCR, and would otherwise wait while macOS compiles
+// them for a program that has not used them yet.
+func TestWDAOpenWarmsOCR(t *testing.T) {
+	warmed := 0
+	old := ocrWarm
+	ocrWarm = func() { warmed++ }
+	defer func() { ocrWarm = old }()
+	f := &fakeWDA{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/wda/screen") {
+			fmt.Fprint(w, `{"value":{"scale":3,"screenSize":{"width":390,"height":844}}}`)
+			return
+		}
+		f.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	d, err := openWDA(context.Background(), driver.Info{ID: "sim"}, newWDAURL(srv.URL, ""), goios.DeviceEntry{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if warmed != 1 {
+		t.Fatalf("OCR warmed %d times, want once", warmed)
 	}
 }

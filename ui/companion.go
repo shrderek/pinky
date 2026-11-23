@@ -16,7 +16,7 @@ import (
 	"github.com/DIYgod/pinky/internal/update"
 )
 
-// Pinky for Android (Pinky Companion before November 2026; the package is
+// Pinky on the phone (Pinky Companion before November 2026; the package is
 // still app.pinky.companion) is the Android app that reads the screen and
 // types for Pinky. It ships inside Pinky; a phone without it, or with an
 // older one, gets an Install card on its page. Nothing is installed without
@@ -389,7 +389,7 @@ func (a *app) companionCard(c *mg.Context, d gateway.DeviceView) {
 	mg.Column(c.Key("companion-"+id)).Padding(14).Radius(12).Background(p.bg2).Border(1, p.line).Gap(8).
 		Label(locales.CompanionCardLabel(d.Info.Name)).Children(func() {
 		mg.Row(c).Gap(8).AlignItems(mg.Center).Children(func() {
-			mg.Icon(c, icAndroid).FontSize(16).TextColor(p.ink2)
+			mg.Icon(c, icAndroid).FontSize(iconBody).TextColor(p.ink2)
 			mg.Text(c, title).FontSize(fsHeadline).FontWeight(fwSemibold).Grow(1).MinWidth(0)
 		})
 		if body != "" && !busy {

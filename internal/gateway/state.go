@@ -76,6 +76,9 @@ type device struct {
 	// agent works on the phone. workSent: dev was told at all.
 	working, workSent bool
 	locked            bool
+	// screenOff is set while an idle phone that someone watches has its
+	// own screen off without a lock screen (wake.go).
+	screenOff bool
 	// busy is who holds the phone while the agent's task waits for it:
 	// Pinky on the phone, or another computer (onphone.go).
 	busy *driver.BusyError
@@ -102,6 +105,9 @@ type device struct {
 	// inputs counts input sent to the phone, by the agent or the person. A
 	// history screenshot is dropped when input came while it was taken.
 	inputs uint64
+	// inputAt is when input last went to the phone (inputLocked), or the
+	// read that ended an agent's action was made (appswitch.go).
+	inputAt time.Time
 	// shot is the history screenshot being taken, or waiting for a read to
 	// confirm it; kept is the last one kept, which steps reuse while the
 	// screen matches (see shots.go).
@@ -112,6 +118,16 @@ type device struct {
 	wokeAt time.Time
 	// lockReadAt is when an idle phone's lock state was last read.
 	lockReadAt time.Time
+	// lockSeq counts the lock states recorded (setLocked), whether they
+	// changed locked or not. A fresh read that sees the phone unlocked
+	// clears locked only when nothing else recorded a state meanwhile
+	// (unlockedNow).
+	lockSeq uint64
+	// quietWhy says why the person holds the phone now (quietPerson,
+	// quietHandoff), and quiet lists when they held it lately: phone_traffic
+	// never returns requests made then (traffic.go).
+	quietWhy uint8
+	quiet    []span
 	// personAt is when the person last used the phone's own screen while
 	// an agent worked on a background display (which does not pause it).
 	personAt time.Time
@@ -216,6 +232,12 @@ type lease struct {
 	endedBy  string // an Outcome
 	// baseline is the last screen the agent received, for diffs.
 	baseline *screen.Screen
+	// mark is what the gateway knew of input when baseline was set, and
+	// calls counts the agent's calls that may change the screen (all but
+	// reads) from their start: together they tell an app that came to the
+	// front by nobody's input Pinky knows of (appswitch.go).
+	mark  inputMark
+	calls uint64
 	// apps is the task's app allow-list, ids and names.
 	apps []string
 	// grants holds the rules the person allowed for the rest of the task,
@@ -270,6 +292,11 @@ type lease struct {
 	// logsRead is set once the agent read an app's logs: the driver may
 	// listen to the phone until the task ends (driver.LogListener).
 	logsRead bool
+	// trafficGranted is set when the person allowed the agent to read the
+	// phone's network traffic for the rest of the task (traffic.go), and
+	// trafficBodiesGranted when they allowed its bodies too.
+	trafficGranted       bool
+	trafficBodiesGranted bool
 	// settingsGranted is set when the person allowed changing the phone's
 	// settings for the rest of the task (switches.go).
 	settingsGranted bool
@@ -305,6 +332,9 @@ type task struct {
 	approvals  int
 	next       int  // the next step index
 	readOnly   bool // the agent asked for read-only (TaskView.ReadOnly)
+	// continued says the task ran before and runs again for Pinky's own
+	// agent (AgentInfo.Continue).
+	continued bool
 }
 
 // maxTaskSteps bounds the steps a running task keeps in memory; history
@@ -332,6 +362,11 @@ const (
 	OutcomeReplaced     = "replaced"     // the agent started another task on the device; only in history from before phone_connect refused that (shared.go)
 	OutcomePaused       = "paused"       // the person paused Pinky's connection to the phone (pause.go)
 )
+
+// outcomeGatewayStopped is the outcome of a task that ran when the gateway
+// stopped (Close), or when it crashed or was killed, which the next
+// gateway's start records.
+const outcomeGatewayStopped = "gateway stopped"
 
 // stateForOutcome maps how a task ended to its card state. An agent that
 // leaves or idles without phone_release has not failed, so those count as

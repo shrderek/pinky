@@ -76,6 +76,11 @@ type Background struct {
 	// the display has no window, which accessibility reports as it does a
 	// display it cannot see, so Observe shows it as empty.
 	started atomic.Bool
+	// read is set once the companion read the display's windows: Android
+	// lets accessibility see it, so a later read that finds it untracked
+	// means it has no window left (its app closed), not that Pinky cannot
+	// read it.
+	read atomic.Bool
 	// launch is the app last started on the display, when, and how many
 	// nudges its reads have sent since (nudgeAfterLaunch). Guarded by mu.
 	launch     launchTarget
@@ -398,7 +403,7 @@ func (b *Background) ObserveWithText(ctx context.Context, opt driver.ObserveOpti
 	if err != nil {
 		return nil, TextStats{}, err
 	}
-	st := addText(ctx, s, scanCompanion(t), opt, since, textSource{
+	st := addText(ctx, s, scanRead(s, t), opt, since, textSource{
 		frame: opt.Frame,
 		moved: func(_ context.Context, since time.Time, _ screen.App) bool {
 			changed, ok := b.d.comp.windowSince(b.display, since)
@@ -452,6 +457,15 @@ func (b *Background) observeTree(ctx context.Context) (*screen.Screen, *companio
 				}
 				return s, nil, err
 			}
+			// Accessibility read the display before and stopped tracking
+			// it when its last window went: the app left it (Back from its
+			// first screen, a crash, Android stopping it). An empty
+			// display, or the gateway would move the task to the phone's
+			// own screen.
+			if b.read.Load() {
+				s, err := b.emptyScreen(ctx)
+				return s, nil, err
+			}
 			return nil, nil, err
 		}
 		if ctx.Err() == nil {
@@ -459,15 +473,17 @@ func (b *Background) observeTree(ctx context.Context) (*screen.Screen, *companio
 		}
 		return nil, nil, err
 	}
+	b.read.Store(true)
 	s := t.Screen(companion.ScreenOptions{})
 	s.CapturedAt = c.HostTime(t.Time)
-	s.App.Name = b.d.companionAppName(s.App)
 	if s.App.ID == "" && b.started.Load() {
 		b.nudge(ctx, t)
 	}
 	// The phone's lock screen is on the main display; from Android 13 the
 	// virtual display is always unlocked.
 	s.Locked = t.Locked && !b.d.alwaysUnlocked()
+	b.d.hiddenApp(ctx, t, s, b.display)
+	s.App.Name = b.d.companionAppName(s.App)
 	return s, t, nil
 }
 
@@ -477,7 +493,11 @@ func (b *Background) Screenshot(ctx context.Context) (image.Image, error) {
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	img, err := png.Decode(bytes.NewReader(out))
+	pic, _, ok := cutPNG(out)
+	if !ok {
+		pic = out
+	}
+	img, err := png.Decode(bytes.NewReader(pic))
 	if err != nil {
 		return nil, fmt.Errorf("android: screencap of display %d: %q: %w", b.display, firstLine(out), driver.ErrUnsupported)
 	}

@@ -33,6 +33,9 @@ type fakeConn struct {
 	net.Conn
 	wmu sync.Mutex
 	sub bool // subscribed; guarded by fakeApp.mu
+	// dead: the service behind it stopped, but the client was not told; its
+	// next request ends it instead of an answer. Guarded by fakeApp.mu.
+	dead bool
 }
 
 func (c *fakeConn) send(v any) {
@@ -107,6 +110,10 @@ func (a *fakeApp) serve(c *fakeConn) {
 			a.mu.Unlock()
 		case "claim":
 			a.mu.Lock()
+			if c.dead {
+				a.mu.Unlock()
+				return
+			}
 			var result map[string]any
 			var perr *companion.Error
 			switch {
@@ -183,6 +190,16 @@ func (a *fakeApp) restart(computer *companion.Claim) {
 	}
 	for c := range a.conns {
 		c.Close()
+	}
+}
+
+// restartQuietly stops the service without telling its clients, as
+// Android's LocalSocket.close did: each learns it at its next request.
+func (a *fakeApp) restartQuietly() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for c := range a.conns {
+		c.dead = true
 	}
 }
 
@@ -294,5 +311,68 @@ func TestClaims(t *testing.T) {
 	}
 	if changes.Load() == 0 {
 		t.Error("changed was never called")
+	}
+
+	// A service that stopped without ending the core's connection: the
+	// claim goes through on the connection Watch opens next, and so does
+	// Stop on the pill.
+	app.computerClaims(nil)
+	eventually(t, "the phone is free", func() bool { _, _, ok := computer(); return !ok })
+	app.restartQuietly()
+	if busy, err := cl.Claim(ctx, "Feed the cat"); busy || err != nil {
+		t.Fatalf("Claim after a quiet restart = %v, %v", busy, err)
+	}
+	if task, held, _ := app.phone(); !held || task != "Feed the cat" {
+		t.Fatalf("the app's claim after a quiet restart: %q, %v", task, held)
+	}
+	cl.Release(ctx)
+	app.restartQuietly()
+	if err := cl.StopComputer(ctx); err != nil {
+		t.Fatalf("StopComputer after a quiet restart: %v", err)
+	}
+}
+
+// A request that finds its subscription dead waits for the next one while
+// it holds the claims lock, so Watch must not wait on that lock to go on
+// with a subscription it just opened (a 5 s stall, then "does not answer",
+// when Stop on the pill came right after the service restarted).
+func TestClaimsRequestWhileWatchReclaims(t *testing.T) {
+	app := newFakeApp(t)
+	cl := newClaims(companion.NewFor(app, companion.Release))
+	cl.retry = 10 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cl.Watch(ctx, func() {}, func() {})
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	sub := func() *companion.Subscription {
+		cl.mu.Lock()
+		defer cl.mu.Unlock()
+		return cl.sub
+	}
+	eventually(t, "Watch subscribes", func() bool { return sub() != nil })
+	first := sub()
+
+	// A request holds the lock while the service restarts: Watch opens a
+	// new subscription and wants the lock to make the core's claim again.
+	cl.op.Lock()
+	defer cl.op.Unlock()
+	app.restart(nil)
+	eventually(t, "Watch subscribes again", func() bool { s := sub(); return s != nil && s != first })
+	app.restartQuietly()
+
+	rctx, rcancel := context.WithTimeout(ctx, 2*time.Second)
+	defer rcancel()
+	err := cl.request(rctx, func(s *companion.Subscription) error {
+		_, err := s.StopClaim(rctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("a request while Watch reclaims: %v", err)
 	}
 }

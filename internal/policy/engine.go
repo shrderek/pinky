@@ -194,9 +194,12 @@ func (e *Engine) Evaluate(in Input) Verdict {
 	kinds := detect(in, cats)
 	system := contains(cats, CatSystem)
 
-	if in.Op == OpType && IsCredentialField(in.Target) {
-		return Verdict{Decision: Deny, Rule: RuleCredentials, Kinds: kinds,
-			Reason: "Pinky never types into password or one-time-code fields; call phone_handoff so the person can fill it."}
+	if in.Op == OpType && IsCredentialField(in.Target) && !(in.Virtual && e.file.VirtualCredentials) {
+		reason := "Pinky never types into password or one-time-code fields; call phone_handoff so the person can fill it."
+		if in.Virtual {
+			reason += " On a virtual phone the person may allow it in Pinky's Settings › Safety."
+		}
+		return Verdict{Decision: Deny, Rule: RuleCredentials, Kinds: kinds, Reason: reason}
 	}
 	if in.Op == OpLaunch && in.LaunchURL {
 		if why, refused := LinkRefused(in.Link); refused {
@@ -206,7 +209,7 @@ func (e *Engine) Evaluate(in Input) Verdict {
 			return Verdict{Decision: Deny, Rule: RuleUnsafeLinks, Kinds: kinds, Reason: why}
 		}
 	}
-	if len(in.ScopeApps) > 0 && !system && !appIn(app, in.ScopeApps) && !(in.Op == OpKey && in.Key == "home") {
+	if scoped(in) && !system && !appIn(app, in.ScopeApps) && !(in.Op == OpKey && in.Key == "home") {
 		return Verdict{Decision: Deny, Rule: RuleAgentScope, Kinds: kinds, Scope: true,
 			Reason: fmt.Sprintf("%s is outside this agent's scope.", appName(app))}
 	}
@@ -252,23 +255,47 @@ func (e *Engine) Evaluate(in Input) Verdict {
 		v.Asks = asks
 	}
 
-	if in.ReadOnly || e.readOnlyLocked(in.Device) {
+	if global := e.readOnlyLocked(in.Device); in.ReadOnly || global {
+		why, fix := readOnlyWhy(in, global)
 		switch {
 		case v.Decision == Ask && onlyEvery(v.Asks):
 			// Read-only still lets the agent look around; with "every
 			// action asks" those steps keep asking.
 		case v.Decision == Ask:
 			v.Decision = Deny
-			v.Reason = fmt.Sprintf("Read-only mode is on, and this would need approval (%s).", v.Rule)
+			v.Reason = fmt.Sprintf("%s, and this would need approval (%s). %s", why, v.Rule, fix)
 			v.Rule = RuleReadOnly
 		case v.Decision == Allow && in.Op == OpType && !IsSearchBox(in.Target, in.Screen):
 			v.Decision, v.Rule = Deny, RuleReadOnly
-			v.Reason = "Read-only mode is on: the agent may type only into search fields."
+			v.Reason = why + ": the agent may type only into search fields. " + fix
 		}
 	}
 	// The person's "Always allow" answers come last: they lift asks, never
 	// a deny or read-only mode.
 	return e.liftLocked(v, app)
+}
+
+// readOnlyWhy says why an action runs read-only, for a refusal: Read-only
+// mode in Settings › Safety (global), the read-only access the person
+// gave the agent (Input.ReadOnlyAccess), or the agent's own request for a
+// read-only task; and what changes it. phone_request_approval changes
+// none of them (GitHub issue #156).
+func readOnlyWhy(in Input, global bool) (why, fix string) {
+	var whys, fixes []string
+	if in.ReadOnly && in.ReadOnlyAccess {
+		whys = append(whys, "this agent has read-only access, which the person gave it when it first connected")
+		fixes = append(fixes, "The person can change what it may do in Pinky's Settings › Agents (Change).")
+	} else if in.ReadOnly {
+		whys = append(whys, "this task is read-only, as the agent asked in phone_connect")
+		fixes = append(fixes, "To do more, connect again for a new task without read_only.")
+	}
+	if global {
+		whys = append(whys, "Read-only mode is on in Pinky's Settings › Safety, for every agent")
+		fixes = append(fixes, "The person can turn it off there.")
+	}
+	fixes = append(fixes, "Asking with phone_request_approval does not lift it.")
+	why = strings.Join(whys, ", and ")
+	return strings.ToUpper(why[:1]) + why[1:], strings.Join(fixes, " ")
 }
 
 // askReason explains an Ask verdict.
@@ -359,6 +386,9 @@ func (r Rule) matches(app screen.App, cats []string, kinds []Kind, in Input) boo
 	}
 	return true
 }
+
+// scoped reports whether the agent may use only the apps in in.ScopeApps.
+func scoped(in Input) bool { return in.Scoped || len(in.ScopeApps) > 0 }
 
 // appIn reports whether the app matches any entry, by id or by name.
 func appIn(app screen.App, list []string) bool {

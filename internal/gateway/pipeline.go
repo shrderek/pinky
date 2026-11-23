@@ -311,9 +311,22 @@ func (s *Session) Act(ctx context.Context, c Call, a Action) *Result {
 // gate refuses a call the device cannot take now. Reads (action false) pass
 // while the person is in control or an approval is open.
 func (g *Gateway) gate(l *lease, approvalID string, action bool) *Result {
+	return g.gateOnce(l, approvalID, action, true)
+}
+
+// gateOnce is gate. With fresh, an action on a phone the gateway last saw
+// locked asks the phone once more before it is refused (unlockedNow): the
+// phone may have been unlocked since, by a script or by hand, and the
+// gateway reads the lock state only every few seconds (pollLocks).
+func (g *Gateway) gateOnce(l *lease, approvalID string, action, fresh bool) *Result {
+	// The wait leaves the call time to act within its budget: a phone
+	// moving to another connection for the task may take a minute
+	// (switchWait).
+	wctx, cancel := context.WithTimeout(l.ctx, max(g.opt.CallBudget-switchReserve, g.opt.CallBudget/2))
+	defer cancel()
 	g.mu.Lock()
 	d := l.dev
-	for !l.ended && g.waitMovingLocked(l.ctx, d) {
+	for !l.ended && g.waitMovingLocked(wctx, d) {
 		// It was moving between its cable and Wi-Fi, or Pinky was opening
 		// it again (wifi.go).
 	}
@@ -326,6 +339,10 @@ func (g *Gateway) gate(l *lease, approvalID string, action bool) *Result {
 		return statusResult(StatusStopped, "The lease ended (%s). End the task, or call phone_connect again.", l.endedBy)
 	case waitingLocked(d):
 		res := setupResultLocked(d, fmt.Sprintf("%s is connected but waits for a step before Pinky can use it. Nothing was done.", d.name()))
+		g.mu.Unlock()
+		return res
+	case !d.online && d.switching != "":
+		res := errResult(ErrDeviceOffline, "%s", stillMovingMessage(d.name(), d.switching))
 		g.mu.Unlock()
 		return res
 	case !d.online:
@@ -359,7 +376,12 @@ func (g *Gateway) gate(l *lease, approvalID string, action bool) *Result {
 				busy.Rule, busy.Title, tool, busy.ID)}
 	}
 	if d.locked && l.bg == nil {
+		seq := d.lockSeq
 		g.mu.Unlock()
+		if fresh && g.unlockedNow(l, seq) {
+			// Everything above may have changed while the phone answered.
+			return g.gateOnce(l, approvalID, action, false)
+		}
 		return g.withCurrentScreen(l, statusResult(StatusLocked,
 			"The phone is locked. Nothing was done. Call phone_handoff so the person can unlock it."))
 	}
@@ -463,7 +485,7 @@ func (g *Gateway) act(ctx context.Context, l *lease, c Call, a Action) *Result {
 		if ctx.Err() != nil {
 			return errResult(ErrInternal, "The call was cancelled. Nothing was done.")
 		}
-		return errResult(ErrInternal, "Another action on the phone was still running when the call's %s ran out. Nothing was done. Observe, then try again.", human(g.opt.CallBudget))
+		return busyOutOfTime(g.opt.CallBudget)
 	}
 	// Check again under the device's action lock: another call may have
 	// opened an approval, or the person may have taken over, meanwhile.
@@ -484,8 +506,13 @@ func (g *Gateway) act(ctx context.Context, l *lease, c Call, a Action) *Result {
 			return res
 		}
 	}
+	readAt := time.Now()
 	cur, err := g.startScreen(ctx, l, c)
 	if err != nil {
+		if res := g.homeUnread(ctx, l, c, a, err); res != nil {
+			d.act.Unlock()
+			return res
+		}
 		d.act.Unlock()
 		return g.readError(l, err)
 	}
@@ -493,6 +520,12 @@ func (g *Gateway) act(ctx context.Context, l *lease, c Call, a Action) *Result {
 		d.act.Unlock()
 		return g.attachScreen(l, statusResult(StatusLocked,
 			"The phone is locked. Nothing was done. Call phone_handoff so the person can unlock it."), cur)
+	}
+	if aimed(a) {
+		if from, to, ok := g.switchedApp(l, cur, readAt, true); ok {
+			d.act.Unlock()
+			return g.attachScreen(l, statusResult(StatusStale, "%s", switchedStale(from, to)), cur)
+		}
 	}
 	p, res := g.prepare(ctx, l, a, cur)
 	if res != nil && p.unplaced {
@@ -577,6 +610,42 @@ func (g *Gateway) launchUnread(ctx context.Context, l *lease, c Call, a Action) 
 	if !reports || waits {
 		return nil
 	}
+	return g.runUnread(ctx, l, c, a)
+}
+
+// homeUnread presses Home when the read before it failed, as it fails on a
+// screen the driver cannot read (one that never stops changing, GitHub
+// issue #174, or a stalled app): Home is the way out of such a screen, the
+// rules allow it in any app, and the read after it says where the phone
+// went. Not when the phone is gone, locked or held by someone else, or the
+// call is out of time; then, and for any other action, it returns nil and
+// the read's error stands.
+func (g *Gateway) homeUnread(ctx context.Context, l *lease, c Call, a Action, err error) *Result {
+	if a.Tool != "key" || a.Key != "home" || ctx.Err() != nil {
+		return nil
+	}
+	for _, stop := range []error{driver.ErrOffline, driver.ErrLocked, driver.ErrStoppedOnPhone, driver.ErrBusy, errOutOfTime, context.Canceled} {
+		if errors.Is(err, stop) {
+			return nil
+		}
+	}
+	var be *driver.BusyError
+	if errors.As(err, &be) {
+		return nil
+	}
+	g.mu.Lock()
+	waits := g.stepWaitsLocked(l.dev)
+	g.mu.Unlock()
+	if waits {
+		return nil
+	}
+	return g.runUnread(ctx, l, c, a)
+}
+
+// runUnread runs an action without a read of the screen it starts from:
+// the rules see no screen, and an Ask they return without the person's
+// allowance for the task makes it return nil, for the usual path.
+func (g *Gateway) runUnread(ctx context.Context, l *lease, c Call, a Action) *Result {
 	p, res := g.prepare(ctx, l, a, nil)
 	if res != nil {
 		g.recordRefusal(l, c, a, p, res)
@@ -785,11 +854,13 @@ func (g *Gateway) prepare(ctx context.Context, l *lease, a Action, cur *screen.S
 	readOnly := l.readOnly
 	fgAllowed := allowsLocked(l, fg)
 	prov := d.provider // discovery sets it again under g.mu
+	virtual := d.info.Virtual
 	g.mu.Unlock()
 	p.input = policy.Input{Device: d.id, App: fg, Screen: cur, TaskApps: apps, LongPress: a.LongPress,
-		ReadOnly: scope.Mode == ScopeReadOnly || readOnly, AllowBlocked: fgAllowed}
+		ReadOnly: scope.Mode == ScopeReadOnly || readOnly, ReadOnlyAccess: scope.Mode == ScopeReadOnly,
+		AllowBlocked: fgAllowed, Virtual: virtual}
 	if scope.Mode == ScopeApps {
-		p.input.ScopeApps = scope.Apps
+		p.input.Scoped, p.input.ScopeApps = true, scope.Apps
 	}
 
 	if rule, blocked := g.policy.Blocked(fg); blocked && !fgAllowed && a.Tool != "launch" && !(a.Tool == "key" && a.Key == "home") {
@@ -838,7 +909,7 @@ func (g *Gateway) prepare(ctx context.Context, l *lease, a Action, cur *screen.S
 			p.target = hitTest(cur, p.point)
 		}
 		p.hasPt = true
-		if pad, ok := policy.HiddenKeypad(cur); ok && pad.Contains(p.point) {
+		if pad, ok := policy.HiddenKeypad(cur); ok && pad.Contains(p.point) && !g.policy.CredentialTypingAllowed(virtual) {
 			// The app's own passcode keypad, which the person watching
 			// cannot see: a tap on it enters their passcode.
 			p.input.Target = p.target
@@ -863,7 +934,7 @@ func (g *Gateway) prepare(ctx context.Context, l *lease, a Action, cur *screen.S
 			p.target, p.point, p.hasPt = e, e.Bounds.Center(), true
 		} else if f, ok := cur.Focused(); ok {
 			p.target = &f
-		} else if credentialOnScreen(cur) {
+		} else if credentialOnScreen(cur) && !g.policy.CredentialTypingAllowed(virtual) {
 			// The focused field is unknown and might be the password field.
 			return p, &Result{Status: StatusBlocked, Rule: policy.RuleCredentials,
 				Message: "This screen has a password or code field and Pinky cannot tell which field has focus. Nothing was done. Pass ref to type into a specific field, or call phone_handoff for credentials."}
@@ -901,6 +972,7 @@ func (g *Gateway) prepare(ctx context.Context, l *lease, a Action, cur *screen.S
 				p.from, p.to = swipeLine(area, a.Direction)
 			}
 		}
+		p.input.Move = screen.Point{X: p.to.X - p.from.X, Y: p.to.Y - p.from.Y}
 	case "pinch":
 		p.input.Op = policy.OpSwipe
 		if dev, _ := g.screenOf(d); dev != nil {
@@ -924,6 +996,9 @@ func (g *Gateway) prepare(ctx context.Context, l *lease, a Action, cur *screen.S
 	case "key":
 		p.input.Op = policy.OpKey
 		p.input.Key = a.Key
+		if cur == nil {
+			break // home pressed without a read (homeUnread)
+		}
 		if f, ok := cur.Focused(); ok {
 			p.target = &f
 		}
@@ -1555,9 +1630,18 @@ func (g *Gateway) pendingResult(l *lease, info approval.Info) *Result {
 	if info.Kind == approval.KindHandoff {
 		what = "hand control back"
 	}
-	return &Result{Status: StatusPending, ApprovalID: info.ID, Rule: info.Rule,
-		Message: fmt.Sprintf("Still waiting for the person to %s (%s). Nothing was done yet. Repeat the same call with approval_id %q; the person has %s left.",
-			what, info.Title, info.ID, approval.Human(left))}
+	msg := fmt.Sprintf("Still waiting for the person to %s (%s). Nothing was done yet. Repeat the same call with approval_id %q; the person has %s left.",
+		what, info.Title, info.ID, approval.Human(left))
+	g.mu.Lock()
+	lost := info.Kind == approval.KindHandoff && waitingLocked(l.dev) && l.dev.info.Setup == driver.SetupDeviceService
+	g.mu.Unlock()
+	if lost {
+		// Only a person at the computer can bring the phone back; an agent
+		// nobody watches would wait out the whole handoff.
+		msg += " The phone still waits for the computer's device service to be restarted, which needs a person at the computer and its administrator password. " +
+			"If nobody is at the computer, as in a scheduled or unattended run, stop waiting: release the phone with phone_release and use another one, or end the task."
+	}
+	return &Result{Status: StatusPending, ApprovalID: info.ID, Rule: info.Rule, Message: msg}
 }
 
 func (g *Gateway) withdrawnResult(l *lease, out approval.Outcome) *Result {
@@ -1822,6 +1906,17 @@ func (g *Gateway) executeOn(ctx context.Context, l *lease, c Call, a Action, p *
 	if n, ok := dev.(driver.InputNoter); ok && (a.Tool == "type" || a.Tool == "key") {
 		inputNote = n.TakeInputNote()
 	}
+	if c.unread {
+		// The settle owed since the input went out stays owed: the call
+		// that reads the screen next waits it out first (settleOwed).
+		g.mu.Lock()
+		d.inputAt = time.Now()
+		g.mu.Unlock()
+		res := &Result{Status: StatusUncertain, unread: true,
+			Message: "The swipe was sent; phone_read_list reads the screen it led to when it continues."}
+		g.recordStep(l, step, a, c, p, res, start, before, "", "")
+		return res
+	}
 	limit := g.opt.SettleMax
 	if !p.settleFull {
 		limit = a.settleLimit(limit)
@@ -1850,8 +1945,17 @@ func (g *Gateway) executeOn(ctx context.Context, l *lease, c Call, a Action, p *
 	// early: settle_ms ended the wait while the screen was still changing,
 	// so the read may come before the action's effect shows.
 	early := !settled && limit < g.opt.SettleMax
+	g.mu.Lock()
+	// An app the action opens late still counts as its doing for a while
+	// from this read (appswitch.go).
+	d.inputAt = time.Now()
+	g.mu.Unlock()
 	res := g.screenResult(l, next, false)
 	res.Status = StatusSettled
+	if next.TreeTooSlow {
+		// Not uncertain: the phone took the input, only its tree is slow.
+		res.Message = strings.TrimSpace("The action was delivered to the phone; the screen after it is read without its elements. " + res.Message)
+	}
 	if unread {
 		// GitHub issue #30: not an empty settled screen, but what it is.
 		res.Status = StatusUncertain
@@ -2097,6 +2201,15 @@ func (g *Gateway) perform(ctx context.Context, dev driver.Device, a Action, p *p
 // that prove nothing happened become errors; the rest are uncertain.
 func (g *Gateway) actionError(l *lease, err error) *Result {
 	if res := g.onPhoneResult(l, err); res != nil {
+		return res
+	}
+	var se *driver.SetupError
+	if errors.As(err, &se) && se.Setup != "" {
+		// The phone refused what the input needs, and says why: an iPhone
+		// whose camera or microphone an app uses refuses the stream that
+		// input goes over (driver.SetupMediaInUse). The phone stays open.
+		res := statusResult(StatusNeedsSetup, "%s Nothing was done.", strings.TrimSpace(se.Detail))
+		res.Setup = se.Setup
 		return res
 	}
 	switch {
@@ -2459,6 +2572,7 @@ func (g *Gateway) screenResult(l *lease, raw *screen.Screen, full bool) *Result 
 	view.Events = evs
 	prev := l.baseline
 	l.baseline = view
+	l.mark = inputMark{inputs: d.inputs, calls: l.calls}
 	name := d.name()
 	g.mu.Unlock()
 	res := &Result{Device: d.id, DeviceName: name, Screen: view}
@@ -2471,9 +2585,41 @@ func (g *Gateway) screenResult(l *lease, raw *screen.Screen, full bool) *Result 
 	if rule != "" {
 		res.Rule = rule
 		res.Message = fmt.Sprintf("The foreground app is blocked by the rule %q; Pinky hides its screen. Press home or launch another app.", rule)
+	} else if raw.Unsettled {
+		res.Message = unsettledMessage
+	} else if raw.AppHidden {
+		res.Message = appHiddenMessage
+	} else if raw.TreeTooSlow {
+		res.Message = treeTooSlowMessage
 	}
 	return res
 }
+
+// treeTooSlowMessage goes with a read whose element tree the phone did not
+// give in time (screen.Screen.TreeTooSlow): Pinky on the iPhone on a
+// screen whose tree takes it tens of seconds, such as a long list.
+const treeTooSlowMessage = "Pinky on the iPhone did not give this screen's elements in time (some screens, such as long lists " +
+	"in some apps, take it tens of seconds), so this read has no refs: only the app, the lock state and any text OCR read " +
+	"from a picture of the screen. Tap by x and y, ask for a screenshot (phone_observe screenshot: true) to see the screen, " +
+	"or use phone_key (back, home) to leave the page; keys work as usual. For the next few minutes, reads of this app " +
+	"ask the phone for fewer of its elements, or none, so that they come sooner."
+
+// appHiddenMessage goes with a read where the phone gave Pinky's
+// accessibility service no window of the app in front, so that the
+// driver named the app from the window manager (screen.Screen.AppHidden,
+// GitHub issue #191).
+const appHiddenMessage = "Android did not give this app's window to Pinky's accessibility service (some phones keep certain apps, " +
+	"such as WeChat on ColorOS, from accessibility services), so Pinky gets none of the app's elements: " +
+	"this read has only other windows' elements and any text OCR read from a picture of the screen (phone_observe ocr: true). " +
+	"Tap the app by x and y, or ask for a screenshot where the app's rules allow one. " +
+	"If the app has just started, observe again in a few seconds: it may not have shown its window yet."
+
+// unsettledMessage goes with a read whose screen kept changing, so that the
+// driver could read no element tree (screen.Screen.Unsettled).
+const unsettledMessage = "The screen kept changing (an animation or a live page), so Pinky could not read its elements: " +
+	"this read has no refs, only the app, lock and keyboard state and any text OCR read from a picture of the screen, " +
+	"which may already be out of date. Tap by x and y, ask for a screenshot (phone_observe screenshot: true) to see the screen, " +
+	"or use phone_key (back, home) to leave the page; keys work as usual."
 
 // settle waits until the screen stops changing, up to limit. A limit of 0,
 // or under a millisecond, does not wait, and reports the screen as not

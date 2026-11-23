@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	goios "github.com/danielpaulus/go-ios/ios"
@@ -50,8 +51,14 @@ type wdaClient struct {
 	// returned func after it: it counts the phone as used (rest_wda.go).
 	enter func() func()
 
-	mu  sync.Mutex
-	sid string // the WebDriver session
+	mu    sync.Mutex
+	sid   string // the WebDriver session
+	depth int    // snapshotMaxDepth as last set in the session; 0 none yet
+
+	// inputAt is when the last request that may change the screen went
+	// out (anything but a read or a setting), unix nanos: a tree read
+	// that began before it shows the screen from before (wda_tree.go).
+	inputAt atomic.Int64
 }
 
 // wdaDialError is a connection to WDA's port on the phone that could not be
@@ -183,7 +190,16 @@ func (c *wdaClient) call(ctx context.Context, hc *http.Client, method, path stri
 	if c.enter != nil {
 		defer c.enter()()
 	}
+	if isInput(method, path) {
+		c.inputAt.Store(time.Now().UnixNano())
+	}
 	return c.send(ctx, hc, method, path, body, out)
+}
+
+// isInput reports whether a request may change what the screen shows:
+// anything but a read (GET), a new session or its settings.
+func isInput(method, path string) bool {
+	return method != http.MethodGet && method != http.MethodDelete && path != "/session" && !strings.HasSuffix(path, "/appium/settings")
 }
 
 // send is call without counting a use, for ending the session when idle.
@@ -292,21 +308,37 @@ func (c *wdaClient) waitReady(ctx context.Context) (wdaStatus, error) {
 }
 
 // wdaSettings are the session settings Pinky uses. Snapshots stop at a
-// depth that covers real apps; the MJPEG picture is the screen at half size,
+// depth that covers real apps (less for an app whose tree is too slow,
+// wda_tree.go); the MJPEG picture is the screen at half size,
 // enough for the mirror and light for the encoder.
 var wdaSettings = map[string]any{
-	"snapshotMaxDepth":             60,
+	"snapshotMaxDepth":             wdaDepth,
 	"mjpegServerFramerate":         15,
 	"mjpegServerScreenshotQuality": 50,
 	"mjpegScalingFactor":           50,
 	"shouldUseCompactResponses":    true,
 	"keyboardAutocorrection":       false,
 	"keyboardPrediction":           false,
+	// XCTest types at most this many keys a second; its default, 60, had
+	// people watch text appear one character at a time (GitHub issue
+	// #101). See wdaTypingFrequency.
+	"maxTypingFrequency": wdaTypingFrequency,
 	// Wait less for the app to idle before reading the tree: Pinky settles
 	// by itself, and some apps never idle (animations).
 	"waitForIdleTimeout":      1,
 	"animationCoolOffTimeout": 0,
 }
+
+// wdaTypingFrequency is the keys a second WDA types at. On the iPhone 13
+// mini (iOS 27.0.1, WDA 16.15.3, Settings' search field) 600 typed 318
+// characters of English, Chinese and emoji in 0.83 s, every one right in
+// each run, where the default of 60 took 1.97 s for 105; 1000 was right
+// too and little faster, so 600 leaves room for slower apps. Pasting, as
+// the CoreDevice path does, is no way here: Command-V through XCTest's
+// typeKey pasted nothing into the field, and /wda/getPasteboard reads only
+// plain text and waits at least 2 s when there is any (docs/notes/ios.md,
+// "Typing through the helper").
+const wdaTypingFrequency = 600
 
 // session returns the WebDriver session, creating it once.
 func (c *wdaClient) session(ctx context.Context) (string, error) {
@@ -329,10 +361,39 @@ func (c *wdaClient) session(ctx context.Context) (string, error) {
 		return "", errors.New("WebDriverAgent: no session id")
 	}
 	c.sid = out.SessionID
+	c.depth = 0
 	if err := c.call(ctx, c.hc, http.MethodPost, "/session/"+c.sid+"/appium/settings", map[string]any{"settings": wdaSettings}, nil); err != nil {
 		return "", err
 	}
+	c.depth = wdaDepth
 	return c.sid, nil
+}
+
+// wdaDepth is the snapshot depth of wdaSettings, which reads use unless
+// their app's tree is too slow (wda_tree.go).
+const wdaDepth = 60
+
+// setDepth sets how deep WDA's snapshots go, unless the session has it
+// already.
+func (c *wdaClient) setDepth(ctx context.Context, depth int) error {
+	sid, err := c.session(ctx)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	same := c.sid == sid && c.depth == depth
+	c.mu.Unlock()
+	if same {
+		return nil
+	}
+	err = c.do(ctx, c.hc, http.MethodPost, "/appium/settings", map[string]any{"settings": map[string]any{"snapshotMaxDepth": depth}}, nil)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.depth = 0 // not known (failed, or a new session took it): set it again next time
+	if err == nil && c.sid == sid {
+		c.depth = depth
+	}
+	return err
 }
 
 // do runs a session request, starting a new session once when WDA lost its
@@ -420,12 +481,12 @@ func (b *wdaBool) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// source reads the page source. The tree of a busy screen takes seconds
+// on a phone, and tens of seconds on some (wda_tree.go): the caller bounds
+// it.
 func (c *wdaClient) source(ctx context.Context) (*wdaNode, error) {
 	var root wdaNode
-	// The tree of a busy screen takes seconds on a phone.
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	if err := c.do(cctx, c.long, http.MethodGet, "/source?format=json", nil, &root); err != nil {
+	if err := c.do(ctx, c.long, http.MethodGet, "/source?format=json", nil, &root); err != nil {
 		return nil, err
 	}
 	return &root, nil
@@ -488,6 +549,15 @@ func (c *wdaClient) keys(ctx context.Context, text string) error {
 	return c.do(ctx, c.long, http.MethodPost, "/wda/keys", map[string]any{"value": []string{text}}, nil)
 }
 
+// hidEvent presses a key of a HID page: page and usage name it, hold is how
+// long it stays down. WDA types keys as characters, which covers what
+// XCUIKeyboardKey names and nothing else; this route takes the usages the
+// arrow and page keys have.
+func (c *wdaClient) hidEvent(ctx context.Context, page, usage int, hold time.Duration) error {
+	body := map[string]any{"page": page, "usage": usage, "duration": hold.Seconds()}
+	return c.do(ctx, c.long, http.MethodPost, "/wda/performIoHidEvent", body, nil)
+}
+
 // clearFocused empties the text field that has the keyboard focus (the
 // active element, in WebDriver's terms). It returns errNoFocus when no
 // field has it.
@@ -513,8 +583,26 @@ func (c *wdaClient) clearFocused(ctx context.Context) error {
 
 var errNoFocus = errors.New("no focused field")
 
+// home brings SpringBoard to the front. A locked phone refuses to open it
+// ("Unable to launch (null) because the device was not, or could not be,
+// unlocked"), and that refused open is what wakes a dark lock screen.
+// There is no home screen to reach while locked, so the wake is the whole
+// answer and the refusal is not an error.
 func (c *wdaClient) home(ctx context.Context) error {
-	return c.call(ctx, c.hc, http.MethodPost, "/wda/homescreen", map[string]any{}, nil)
+	err := c.call(ctx, c.hc, http.MethodPost, "/wda/homescreen", map[string]any{}, nil)
+	if err != nil && isLockedRefusal(err) {
+		return nil
+	}
+	return err
+}
+
+// isLockedRefusal reports iOS refusing to open an app because the phone is
+// locked, the answer /wda/homescreen gets on a lock screen. SpringBoard's
+// own code in the message is about the very request that failed, where a
+// lock state read separately can be a step behind the phone.
+func isLockedRefusal(err error) bool {
+	var e *wdaError
+	return errors.As(err, &e) && strings.Contains(e.Message, "BSErrorCodeDescription=Locked")
 }
 
 // pressHome presses the Home button and nothing more. /wda/homescreen

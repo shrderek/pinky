@@ -45,8 +45,12 @@ func sparseTree(s *screen.Screen) bool {
 // awaitsTree reports whether the result of an action, next, should wait
 // for its tree: it is sparse, and its app's was not sparse for a whole
 // wait before (a game or a canvas, whose text is only ever in the picture).
+// A screen read without its tree because it never stops changing
+// (Unsettled), or of an app the phone hides from accessibility
+// (AppHidden), or whose tree the phone gives too slowly (TreeTooSlow),
+// does not wait: no read in the next seconds would have one.
 func (g *Gateway) awaitsTree(d *device, next *screen.Screen) bool {
-	if !sparseTree(next) {
+	if next.Unsettled || next.AppHidden || next.TreeTooSlow || !sparseTree(next) {
 		return false
 	}
 	g.mu.Lock()

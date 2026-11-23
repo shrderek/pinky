@@ -39,6 +39,19 @@ type AgentInfo struct {
 	// in Pinky's window: it needs no New agent approval, as the person just
 	// asked for it. Its scope and everything else work as any agent's.
 	Trusted bool
+	// Continue is, for Pinky's own agent (Pilot), the id of a task of its
+	// that ended which the session's phone_connect continues: the person
+	// gave the task a new message (pilot.Runner.Continue). The task
+	// runs again as the same task, in Activity and the history, with its
+	// steps so far; a task the gateway no longer has, or one on another
+	// phone, starts afresh.
+	Continue string
+	// Pilot marks a session of Pinky's own agent (internal/pilot): one the
+	// person started (Trusted), or one doing a task another agent handed
+	// it, under that agent's name and without Trusted. Only Pinky's MCP
+	// server sets it; it lets the session continue a task (Continue) and
+	// take the person's messages (PersonSaid), and changes nothing else.
+	Pilot bool
 }
 
 // Status is the outcome of a call, from DESIGN.md's Results table.
@@ -73,7 +86,7 @@ const (
 	// ErrDevicePaused: the person paused Pinky's connection to the phone
 	// in Pinky (pause.go); it is unusable until they resume it.
 	ErrDevicePaused ErrorCode = "device_paused"
-	// ErrDeviceBusy: Pinky on the phone (Pinky for Android's on-phone
+	// ErrDeviceBusy: Pinky on the phone (the Android app's on-phone
 	// mode), or Pinky on another computer, holds the phone for a task of
 	// its own (onphone.go); nothing was done.
 	ErrDeviceBusy      ErrorCode = "device_busy"
@@ -119,6 +132,13 @@ type Result struct {
 	Log        string       // phone_logs: the log lines or crash reports, as text
 	Switches   []SwitchView // phone_device
 	About      *PhoneAbout  // phone_device's read: the phone's model, system, battery and storage
+
+	// outOfTime: the call's budget ran out before the screen could be
+	// read (outOfTimeBeforeAction, outOfTimeAfterAction).
+	outOfTime bool
+	// unread: the action went out and its screen was left unread, as
+	// Call.unread asks.
+	unread bool
 }
 
 // IsError reports whether the result is an error rather than a status.
@@ -147,6 +167,12 @@ type Call struct {
 	// noAsk refuses an action the rules would ask the person about,
 	// instead of asking: phone_read_list never opens an approval.
 	noAsk bool
+	// unread sends the action without waiting for the screen to settle
+	// or reading it afterwards: the settle stays owed, and the caller
+	// reads the screen in a later call. phone_read_list's last swipe on a
+	// phone whose reads take so long that the call has no time left for
+	// the read after it; its continuation reads that screen first.
+	unread bool
 }
 
 // reuseAge is how old the previous step's read may be for the next batch
@@ -271,6 +297,11 @@ type ScanView struct {
 	OutputBytes  int
 	Sections     []ScanPage
 	Continuation string
+	// gap says why a read stopped at a gap (gapNote), for the message.
+	gap string
+	// notes are further sentences for the message: where the read
+	// scrolled when no list was found, or how slow the phone's reads were.
+	notes []string
 }
 
 // Limits from DESIGN.md's tool table.
@@ -374,6 +405,18 @@ func (s *Session) end(outcome string, keep bool) {
 
 // acquire finds the lease a call acts on and marks it busy.
 func (s *Session) acquire(ref string) (*lease, *Result) {
+	return s.acquireFor(ref, true)
+}
+
+// acquireRead is acquire for a call that only reads the screen
+// (phone_observe, phone_wait_for): it does not count in lease.calls.
+func (s *Session) acquireRead(ref string) (*lease, *Result) {
+	return s.acquireFor(ref, false)
+}
+
+// acquireFor is acquire. A call that may change the screen (input) counts
+// in lease.calls (appswitch.go).
+func (s *Session) acquireFor(ref string, input bool) (*lease, *Result) {
 	g := s.g
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -441,6 +484,9 @@ func (s *Session) acquire(ref string) (*lease, *Result) {
 		}
 	}
 	l.inflight++
+	if input {
+		l.calls++
+	}
 	l.lastUsed = time.Now()
 	return l, nil
 }
@@ -547,7 +593,7 @@ func (s *Session) Connect(ctx context.Context, req ConnectRequest) *Result {
 	if !ok {
 		return errResult(ErrInvalidArgument, "connection must be auto, helper or coredevice, not %q.", req.Connection)
 	}
-	if res := s.approveAgent(ctx, req.Call, title, req.ReadOnly); res != nil {
+	if res := s.approveAgent(ctx, req.Call, title, req.ReadOnly, req.Apps); res != nil {
 		return res
 	}
 
@@ -672,6 +718,7 @@ func (s *Session) Connect(ctx context.Context, req ConnectRequest) *Result {
 		}
 	}
 	l := g.newLeaseLocked(s, d, title, req.Apps)
+	continued := l.task.continued
 	l.readOnly, l.task.readOnly = req.ReadOnly, req.ReadOnly
 	l.inflight++
 	shared := g.noteSharedLocked(s)
@@ -681,7 +728,10 @@ func (s *Session) Connect(ctx context.Context, req ConnectRequest) *Result {
 	unknown := g.resolveTaskApps(ctx, l)
 	g.recordSession(s)
 	own := req.OwnScreen && g.useOwnScreen(l)
-	g.addStep(l, connectStep(d.name(), title, req, own))
+	if !continued {
+		// A task that continues has its connection among its steps.
+		g.addStep(l, connectStep(d.name(), title, req, own))
+	}
 	g.emit(Event{Kind: EventTasks, DeviceID: d.id, TaskID: l.task.id})
 	g.emit(Event{Kind: EventDevices, DeviceID: d.id})
 	res, note := g.taskConnection(ctx, l, way)
@@ -721,6 +771,8 @@ func setupResultLocked(d *device, first string) *Result {
 		msg += " Pinky will not use it until the person trusts it on its page in Pinky or plugs the phone in: tell them, and end the task."
 	case driver.SetupMediaInUse:
 		msg += " The person may be on a call: ask them with phone_handoff to end it or close that app when they can, saying why; the handoff ends by itself once the phone is ready."
+	case driver.SetupDeviceService:
+		msg += " " + deviceServiceHelp
 	default:
 		msg += " Ask the person to do it with phone_handoff, saying what to do; the handoff ends by itself once the phone is ready."
 	}
@@ -731,6 +783,16 @@ func setupResultLocked(d *device, first string) *Result {
 	}
 	return res
 }
+
+// deviceServiceHelp is what an agent can do about a phone the computer's
+// device service lost (driver.SetupDeviceService): only a person at the
+// computer can bring it back, with an administrator's password, so an agent
+// nobody watches must not wait for it.
+const deviceServiceHelp = "Only a person at this computer can fix it: they click Restart device service on the phone's page in Pinky " +
+	"and enter the computer's administrator password, which Pinky cannot do for them (Pinky shows them a card in Needs you and a notification). " +
+	"If nobody is at the computer, as in a scheduled or unattended run, do not wait for it: release it with phone_release and use another phone, " +
+	"or end the task saying the phone needs the device service restarted. " +
+	"Otherwise ask them with phone_handoff; it ends by itself once the phone is back."
 
 // connectStep is the history step of phone_connect. own says the task
 // left the background display the person chose for the phone's own
@@ -766,8 +828,11 @@ func readOnlyNote(res *Result, readOnly bool) *Result {
 
 func (g *Gateway) newLeaseLocked(s *Session, d *device, title string, apps []string) *lease {
 	now := time.Now()
-	t := &task{id: history.NewID("t_"), sessionID: s.id, title: title, agent: s.agent.Name, deviceID: d.id,
-		deviceName: d.name(), state: TaskWorking, started: now}
+	t := g.reopenLocked(s, d)
+	if t == nil {
+		t = &task{id: history.NewID("t_"), sessionID: s.id, title: title, agent: s.agent.Name, deviceID: d.id,
+			deviceName: d.name(), state: TaskWorking, started: now}
+	}
 	l := &lease{id: history.NewID("l_"), session: s, dev: d, task: t, created: now, lastUsed: now,
 		apps: append([]string(nil), apps...), grants: map[string]bool{}}
 	l.ctx, l.cancel = context.WithCancel(g.ctx)
@@ -790,8 +855,87 @@ func (g *Gateway) newLeaseLocked(s *Session, d *device, title string, apps []str
 	s.leases[d.id] = l
 	s.used = appendUniq(s.used, d.id)
 	g.recordTaskLocked(t)
+	if g.trafficOn[d.id] {
+		g.captureSoon()
+	}
 	return l
 }
+
+// reopenLocked takes back the ended task that s continues on d
+// (AgentInfo.Continue), running again; nil when s continues none, or the
+// gateway no longer has it. Only one phone_connect continues it. The
+// caller holds g.mu.
+func (g *Gateway) reopenLocked(s *Session, d *device) *task {
+	id := s.agent.Continue
+	if id == "" || !s.agent.Trusted && !s.agent.Pilot {
+		return nil
+	}
+	s.agent.Continue = ""
+	for i := len(g.ended) - 1; i >= 0; i-- {
+		t := g.ended[i]
+		if t.id != id {
+			continue
+		}
+		if t.deviceID != d.id || t.agent != s.agent.Name {
+			return nil
+		}
+		g.ended = append(g.ended[:i:i], g.ended[i+1:]...)
+		t.state, t.ended, t.outcome, t.summary = TaskWorking, time.Time{}, "", ""
+		t.deviceName = d.name()
+		t.continued = true
+		return t
+	}
+	return nil
+}
+
+// PersonSaid adds what the person told Pinky's own agent during its task
+// on a phone to the task's steps, as the agent's model reads it: a message
+// typed while the task ran, or the one that continued it. It is ErrNoTask
+// when Pinky's own agent runs no task on the phone. It approves nothing.
+func (g *Gateway) PersonSaid(deviceID, text string) error {
+	return g.said(deviceID, "", text)
+}
+
+// AgentSaid is PersonSaid for a message from the agent that handed Pinky's
+// own agent the task (AgentInfo.Pilot), by its name: the step says the
+// agent said it, never the person.
+func (g *Gateway) AgentSaid(deviceID, agent, text string) error {
+	if strings.TrimSpace(agent) == "" {
+		agent = "Agent"
+	}
+	return g.said(deviceID, strings.TrimSpace(agent), text)
+}
+
+func (g *Gateway) said(deviceID, agent, text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	d := g.devices[deviceID]
+	if d == nil || d.lease == nil || d.lease.ended || !d.lease.session.agent.Trusted && !d.lease.session.agent.Pilot {
+		return ErrNoTask
+	}
+	line := strings.Join(strings.Fields(text), " ")
+	if r := []rune(line); len(r) > 300 {
+		line = string(r[:299]) + "…"
+	}
+	args, said := map[string]any{"text": text}, fmt.Sprintf("You said: “%s”", line)
+	if agent != "" {
+		args["from"], said = agent, fmt.Sprintf("%s said: “%s”", agent, line)
+	}
+	g.addStepLocked(d.lease.task, StepView{Tool: PersonStep, Args: argsJSON(args),
+		Text: said, Status: string(StatusSettled), At: time.Now()}, "", "")
+	return nil
+}
+
+// PersonStep is the tool name of the steps PersonSaid and AgentSaid add.
+const PersonStep = "person_message"
+
+// ErrNoTask is PersonSaid's for a phone where Pinky's own agent runs no
+// task.
+var ErrNoTask = errors.New("gateway: Pinky runs no task on this phone")
 
 func appendUniq(list []string, s string) []string {
 	for _, x := range list {
@@ -922,7 +1066,7 @@ func (g *Gateway) firstScreen(ctx context.Context, l *lease) *Result {
 
 // approveAgent holds an agent's first connection until the person allows
 // it. It returns nil once the agent may connect.
-func (s *Session) approveAgent(ctx context.Context, c Call, title string, readOnly bool) *Result {
+func (s *Session) approveAgent(ctx context.Context, c Call, title string, readOnly bool, apps []string) *Result {
 	g := s.g
 	if g.agentApproved(ctx, s.agent) {
 		return nil
@@ -961,7 +1105,7 @@ func (s *Session) approveAgent(ctx context.Context, c Call, title string, readOn
 			Kind: approval.KindAgent, Binding: b, Rule: "New agent", Agent: s.agent.Name,
 			Title:  fmt.Sprintf("Let %s use your phones?", s.agent.Name),
 			Detail: fmt.Sprintf("%s wants to connect for “%s”. Allowing gives it %s access.", s.agent.Name, title, mode),
-			Data:   agentRequest{readOnly: readOnly},
+			Data:   agentRequest{readOnly: readOnly, apps: cleanApps(apps)},
 		})
 		id = info.ID
 	}
@@ -1230,7 +1374,7 @@ func (s *Session) Observe(ctx context.Context, req ObserveRequest) *Result {
 		}
 		save = name
 	}
-	l, res := s.acquire(req.Device)
+	l, res := s.acquireRead(req.Device)
 	if res != nil {
 		return res
 	}
@@ -1249,6 +1393,7 @@ func (s *Session) Observe(ctx context.Context, req ObserveRequest) *Result {
 	if req.OCR {
 		mode = ocrAll
 	}
+	readAt := time.Now()
 	cur, err := g.observeOCR(ctx, l.dev, mode)
 	if err != nil && errors.Is(err, driver.ErrOffline) && g.expectedBack(l.dev) {
 		// The phone dropped as it moves between its cable and Wi-Fi, or is
@@ -1261,8 +1406,12 @@ func (s *Session) Observe(ctx context.Context, req ObserveRequest) *Result {
 	if err != nil {
 		return g.finish(l, g.readError(l, err))
 	}
+	from, to, switched := g.switchedApp(l, cur, readAt, false)
 	res = g.screenResult(l, cur, true)
 	res.Status = StatusSettled
+	if switched {
+		res.Message = strings.TrimSpace(res.Message + " " + switchedNote(from, to))
+	}
 	if cur.Locked {
 		res.Status = StatusLocked
 		res.Message = "The phone is locked; call phone_handoff so the person can unlock it."
@@ -1374,7 +1523,7 @@ func (s *Session) WaitFor(ctx context.Context, req WaitForRequest) *Result {
 	case timeout == 0:
 		timeout = 10 * time.Second
 	}
-	l, res := s.acquire(req.Device)
+	l, res := s.acquireRead(req.Device)
 	if res != nil {
 		return res
 	}
@@ -1808,6 +1957,7 @@ func (s *Session) Handoff(ctx context.Context, req HandoffRequest) *Result {
 			Title: reason, Detail: fmt.Sprintf("%s · %s", s.agent.Name, l.task.title), Agent: s.agent.Name,
 			TaskID: l.task.id, DeviceName: l.dev.name(), App: g.appName(l.dev), Timeout: g.opt.HandoffTimeout})
 		g.mu.Lock()
+		g.quietLocked(l.dev, quietHandoff, true)
 		if endsOnUnlock {
 			l.unlockHandoffs = append(l.unlockHandoffs, info.ID)
 		}
@@ -1840,6 +1990,12 @@ func (s *Session) Handoff(ctx context.Context, req HandoffRequest) *Result {
 	}
 	if err != nil {
 		return g.finish(l, g.cancelled(l, info.ID))
+	}
+	if out.State != approval.Open {
+		// The handoff ended; a takeover during it keeps the phone quiet.
+		g.mu.Lock()
+		g.quietLocked(l.dev, quietHandoff, false)
+		g.mu.Unlock()
 	}
 	switch {
 	case out.State == approval.Open:

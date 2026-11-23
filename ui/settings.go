@@ -2,7 +2,10 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -33,6 +36,20 @@ type settingsState struct {
 	adding  bool
 	newApp  string
 	confirm bool
+	// recDir is whether the chosen recordings folder is there, as last
+	// seen; picking is while its folder picker is open.
+	recDir  folderCheck
+	picking bool
+}
+
+// folderCheck is whether a folder was there when last looked at. The look
+// happens off the main thread: a folder on a network disk may take long to
+// answer.
+type folderCheck struct {
+	dir      string
+	at       time.Time
+	there    bool
+	checking bool
 }
 
 // changed reports a change in Settings, with the settings as they were
@@ -46,9 +63,11 @@ func (a *app) changed() {
 	}
 }
 
-// clone returns s with a list of blocked apps of its own.
+// clone returns s with a list of blocked apps, and maps, of its own.
 func (s Settings) clone() Settings {
 	s.BlockedApps = append([]BlockedApp(nil), s.BlockedApps...)
+	s.PilotModels = maps.Clone(s.PilotModels)
+	s.PilotURLs = maps.Clone(s.PilotURLs)
 	return s
 }
 
@@ -59,7 +78,7 @@ func (a *app) settingsPage(c *mg.Context) {
 	mg.Row(c).Grow(1).MinHeight(0).AlignItems(mg.Stretch).Children(func() {
 		mg.Column(c).Width(200).Shrink(0).Padding(sp3, 10).Gap(2).BorderWidth(0, 1, 0, 0).BorderColor(p.line).
 			Role(mg.RoleTabList).Label(locales.SettingsSectionsLabel()).Children(func() {
-			tab := func(sec settingsSection, ic *mg.SVG, name string, needs bool) {
+			tab := func(sec settingsSection, ic, icOn *mg.SVG, name string, needs bool) {
 				on := s.sec == sec
 				b := mg.ButtonBase(c.Key(sec)).Height(32).Padding(0, 10, 0, rowInset).Radius(rControl).Gap(10).AlignItems(mg.Center).Justify(mg.Start).
 					Role(mg.RoleTab).Selected(on).Label(name)
@@ -67,35 +86,38 @@ func (a *app) settingsPage(c *mg.Context) {
 				case on:
 					b.Background(p.sel)
 					selectionMark(c, b)
+				case b.Pressed():
+					b.Background(p.sel)
 				case b.Hovered():
 					b.Background(p.bg3)
 				}
+				fillFade(b)
 				if b.Clicked() {
 					s.sec = sec
 				}
 				b.TextColor(navInk(c, b, on)).Children(func() {
-					mg.Icon(c, ic).FontSize(16)
+					mg.Icon(c, pick(on, icOn, ic)).FontSize(iconBody)
 					mg.Text(c, name).FontSize(fsBody).Grow(1)
 					if needs {
 						dot(c, p.amberDot, false).Label(locales.SettingsNeedsYou())
 					}
 				})
 			}
-			tab(secPhones, icAndroid, locales.SettingsSectionPhones(), false)
+			tab(secPhones, icAndroid, icAndroidOn, locales.SettingsSectionPhones(), false)
 			agentsWait := false
 			for _, n := range a.needs {
 				agentsWait = agentsWait || newAgentNeed(n)
 			}
-			tab(secAgents, icPlug, locales.SettingsSectionAgents(), agentsWait)
-			tab(secSafety, icShield, locales.SettingsSectionSafety(), len(a.files.list) > 0)
-			tab(secPrivacy, icEyeOff, locales.SettingsSectionPrivacy(), false)
-			tab(secAdvanced, icSliders, locales.SettingsSectionAdvanced(), false)
+			tab(secAgents, icPlug, icPlugOn, locales.SettingsSectionAgents(), agentsWait)
+			tab(secSafety, icShield, icShieldOn, locales.SettingsSectionSafety(), len(a.files.list) > 0)
+			tab(secPrivacy, icPrivacy, icPrivacyOn, locales.SettingsSectionPrivacy(), false)
+			tab(secAdvanced, icSliders, icSlidersOn, locales.SettingsSectionAdvanced(), false)
 			a.feedbackLink(c)
 		})
 		a.watchFileProblems(c)
 		a.watchGatewaySettings(c)
 		mg.Scroll(c).Grow(1).MinWidth(0).Padding(28, 40).Children(func() {
-			mg.Column(c).MaxWidth(640).Gap(28).Children(func() {
+			mg.Column(c.Key(s.sec)).MaxWidth(640).Gap(28).Transition(swapIn()).Children(func() {
 				switch s.sec {
 				case secPhones:
 					a.settingsPhones(c)
@@ -265,7 +287,7 @@ func (a *app) settingsSafety(c *mg.Context) {
 						st.BlockedApps = withoutBlocked(st.BlockedApps, b)
 						a.changed()
 					}
-					rm.TextColor(p.ink3).Children(func() { mg.Icon(c, icX).FontSize(14) })
+					rm.TextColor(p.ink3).Children(func() { mg.Icon(c, icX).FontSize(iconSmall) })
 				})
 			}
 		})
@@ -290,7 +312,8 @@ func (a *app) settingsSafety(c *mg.Context) {
 			a.toggleRow(c, "unlock", locales.SettingsUnlockFromComputer(), desc, false, &st.UnlockFromComputer)
 		}
 		a.offWhile(c, rulesYAML).Children(func() {
-			a.toggleRow(c, "codes", locales.SettingsSafetyHideCodes(), locales.SettingsSafetyHideCodesDesc(), true, &st.HideCodes)
+			a.toggleRow(c, "codes", locales.SettingsSafetyHideCodes(), locales.SettingsSafetyHideCodesDesc(), false, &st.HideCodes)
+			a.toggleRow(c, "virtual-credentials", locales.SettingsSafetyVirtualCredentials(), locales.SettingsSafetyVirtualCredentialsDesc(), true, &st.VirtualCredentials)
 		})
 	})
 	a.rulesSection(c)
@@ -410,9 +433,11 @@ func (a *app) settingsPhones(c *mg.Context) {
 				if d.Features.Background {
 					a.backgroundRow(c, d, false)
 				}
+				a.trafficRow(c, d, false)
 				a.connectionRows(c, d)
 				a.awayRow(c, d)
 				a.phoneWiFiRow(c, d)
+				a.phoneTasksRow(c, d)
 				mg.Row(c).Padding(sp2, sp4).Gap(sp2).AlignItems(mg.Center).Justify(mg.End).Children(func() {
 					if button(c, locales.PhoneCheckup(), btnOpt{small: true}).Label(locales.SettingsPhonesCheckupLabel(d.Info.Name)).Clicked() {
 						a.openCheckup(d)
@@ -452,7 +477,7 @@ func phoneHead(c *mg.Context, d gateway.DeviceView, line string) {
 		ic = icIphone
 	}
 	mg.Box(c).Size(36, 36).Radius(rControl).Background(p.bg3).Shrink(0).Justify(mg.Center).AlignItems(mg.Center).Children(func() {
-		mg.Icon(c, ic).FontSize(20).TextColor(p.ink2)
+		mg.Icon(c, ic).FontSize(iconLarge).TextColor(p.ink2)
 	})
 	mg.Column(c).Grow(1).MinWidth(0).Gap(2).Children(func() {
 		mg.Text(c, d.Info.Name).FontSize(fsHeadline).FontWeight(fwSemibold)
@@ -471,7 +496,17 @@ type agentsState struct {
 	asks     int               // open first-connection requests, when last read
 	editing  string            // the agent whose scope is being changed
 	choice   map[string]string // scope mode being chosen, by agent or need id
-	apps     map[string]string // apps typed for "Use only the apps I choose"
+	apps     map[string]string // apps chosen for "Use only the apps I choose", as names with commas between
+	// The list of apps to tick (agentapps.go), by agent or need id as
+	// choice and apps are.
+	find    map[string]string   // what narrows the list down
+	first   map[string]string   // the apps the list opened with, which it shows first
+	missing map[string]string   // the apps an agent named that no phone has: shown, never chosen
+	only    map[string]bool     // the list shows the apps chosen alone
+	asked   map[string]string   // the apps an agent's first connection named, by need id
+	done    map[string]bool     // the first-connection needs the person answered
+	left    map[string]leftCard // by agent, its card that went unanswered, for its next one
+	sorted  appsSorted          // the phones' apps in the order the list shows them
 }
 
 func (s *agentsState) load(a *app) {
@@ -508,19 +543,22 @@ func splitApps(s string) []string {
 	return out
 }
 
-// scopePicker is the select of what an agent may do, with the apps field
-// for "Use only the apps I choose". It returns the scope chosen.
+// scopePicker is the select of what an agent may do, with the list of apps
+// to tick for "Use only the apps I choose" (appsPicker). It returns the
+// scope chosen.
 func (a *app) scopePicker(c *mg.Context, key, label string, initial gateway.Scope) gateway.Scope {
 	st := &a.agents
-	if st.choice == nil {
-		st.choice, st.apps = map[string]string{}, map[string]string{}
-	}
+	st.makeMaps()
 	// The choice is kept as a mode, so it survives a change of language.
 	mode, ok := st.choice[key]
 	if !ok {
 		mode = string(initial.Mode)
 		st.apps[key] = strings.Join(initial.Apps, ", ")
+		st.reopen(key)
 	}
+	// The phones' apps are read while the person reads the choices, so the
+	// list is there when "Only the apps I choose" is picked.
+	a.readApps()
 	choice := scopeLabel(gateway.ScopeMode(mode))
 	labels := make([]string, len(scopeChoices))
 	for i, sc := range scopeChoices {
@@ -531,10 +569,7 @@ func (a *app) scopePicker(c *mg.Context, key, label string, initial gateway.Scop
 	st.choice[key] = string(scope.Mode)
 	mg.Text(c, scopeHint(scope.Mode)).FontSize(fsSmall).TextColor(pal(c).ink2).MaxWidth(360).Margin(4, 0, 0, 0)
 	if scope.Mode == gateway.ScopeApps {
-		apps := st.apps[key]
-		mg.TextInput(c.Key("apps-"+key), &apps).Placeholder(locales.SettingsAgentsAppsPlaceholder()).Label(locales.SettingsAgentsApps()).MaxWidth(360)
-		st.apps[key] = apps
-		scope.Apps = splitApps(apps)
+		scope.Apps = a.appsPicker(c, key)
 	}
 	return scope
 }
@@ -543,6 +578,7 @@ func (a *app) scopePicker(c *mg.Context, key, label string, initial gateway.Scop
 // SetAgentScope, which also approves the agent, then Decide, so the
 // gateway keeps the person's choice when the agent picks up the answer.
 func (a *app) approveAgent(n gateway.NeedView, scope gateway.Scope) {
+	a.agents.answered(n)
 	a.remember(n, gateway.AllowOnce, "")
 	scoper, ok := a.api.(agentScoper)
 	name := n.Agent
@@ -688,7 +724,14 @@ func (a *app) settingsAgents(c *mg.Context) {
 				if st.editing == r.name && canScope {
 					mg.Column(c).Gap(8).Padding(0, 0, 0, 44).Children(func() {
 						scope := a.scopePicker(c, r.name, locales.SettingsAgentsScopeLabel(r.name), r.scope)
-						if button(c, locales.SettingsSave(), btnOpt{kind: btnPrimary}).AlignSelf(mg.Start).Clicked() {
+						// As on the first-connection card: a list of apps
+						// with no app in it is not saved.
+						noApps := scope.Mode == gateway.ScopeApps && len(scope.Apps) == 0
+						save := button(c, locales.SettingsSave(), btnOpt{kind: btnPrimary}).AlignSelf(mg.Start).Disabled(noApps)
+						if noApps {
+							save.Tooltip(locales.NeedsApproveNoApps())
+						}
+						if save.Clicked() {
 							if sc, ok := a.api.(agentScoper); ok {
 								name := r.name
 								go func() {
@@ -712,8 +755,10 @@ func (a *app) settingsAgents(c *mg.Context) {
 	if len(rows) == 0 {
 		a.connectAgents(c)
 		a.askSettings(c)
+		a.memorySettings(c)
 	} else {
 		a.askSettings(c)
+		a.memorySettings(c)
 		a.connectAgents(c)
 	}
 	a.remoteAgents(c)
@@ -747,6 +792,76 @@ func keepLabelIn(m locales.Messages, days int) string {
 	return m.SettingsPrivacyKeepDays(days)
 }
 
+// recordingsFolderDesc is the line under Recordings folder: where new
+// recordings go, and why not to the chosen folder while it is missing. It
+// looks at the folder again every few seconds, in the background.
+func (a *app) recordingsFolderDesc(dir string) string {
+	if dir == "" {
+		return locales.SettingsPrivacyRecordFolderDefault()
+	}
+	ck := &a.set.recDir
+	if ck.dir != dir {
+		*ck = folderCheck{dir: dir, there: true} // until seen otherwise
+	}
+	if !ck.checking && time.Since(ck.at) > 3*time.Second {
+		ck.checking = true
+		go func() {
+			fi, err := os.Stat(dir)
+			there := err == nil && fi.IsDir()
+			a.post(func() {
+				if ck.dir == dir {
+					ck.there, ck.at, ck.checking = there, time.Now(), false
+				}
+			})
+		}()
+	}
+	if !ck.there {
+		return locales.SettingsPrivacyRecordFolderMissing(dir)
+	}
+	return locales.SettingsPrivacyRecordFolderDesc(dir)
+}
+
+// chooseRecordingsFolder asks for the folder new recordings go to, off the
+// main thread, as the system's picker blocks until it closes.
+func (a *app) chooseRecordingsFolder(cur string) {
+	if a.set.picking {
+		return
+	}
+	a.set.picking = true
+	open := a.openDialog
+	if open == nil {
+		open = mygo.Dialog.Open
+	}
+	checker, _ := a.api.(recordingsDirChecker)
+	go func() {
+		paths, err := open(mygo.OpenDialogOptions{
+			Title: locales.SettingsPrivacyRecordFolder(), DefaultPath: cur, Directory: true, CreateDirectories: true,
+		})
+		// The gateway refuses some folders; one it would refuse is not kept,
+		// or Settings would show a folder recordings do not go to. The check
+		// follows symbolic links, which may take long on a network disk.
+		var bad error
+		if err == nil && len(paths) > 0 && checker != nil {
+			bad = checker.CheckRecordingsDir(paths[0])
+		}
+		a.post(func() {
+			a.set.picking = false
+			switch {
+			case err != nil:
+				a.toasts = append(a.toasts, locales.SettingsPrivacyRecordFolderFailed(err.Error()))
+			case len(paths) == 0:
+			case errors.Is(bad, gateway.ErrRecordingsDirInside):
+				a.toasts = append(a.toasts, locales.SettingsPrivacyRecordFolderInside())
+			case bad != nil:
+				a.toasts = append(a.toasts, locales.SettingsPrivacyRecordFolderFailed(bad.Error()))
+			case paths[0] != a.settings.RecordingsDir:
+				a.settings.RecordingsDir = paths[0]
+				a.changed()
+			}
+		})
+	}()
+}
+
 func (a *app) settingsPrivacy(c *mg.Context) {
 	p := pal(c)
 	st := &a.settings
@@ -771,6 +886,31 @@ func (a *app) settingsPrivacy(c *mg.Context) {
 		})
 		if a.toggleRow(c, "rec", locales.SettingsPrivacyRecord(), locales.SettingsPrivacyRecordDesc(), false, &st.Record) {
 			a.applyRecording(st.Record)
+		}
+		if st.Record {
+			settingRow(c, locales.SettingsPrivacyRecordSize(), locales.SettingsPrivacyRecordSizeDesc(), false, func() {
+				smaller, original := locales.SettingsPrivacyRecordSmaller(), locales.SettingsPrivacyRecordOriginal()
+				cur := original
+				if st.SmallerRecordings {
+					cur = smaller
+				}
+				if mg.Select(c.Key("rec-size"), &cur, []string{smaller, original}).Label(locales.SettingsPrivacyRecordSize()).Changed() {
+					st.SmallerRecordings = cur == smaller
+					a.changed()
+					a.applyRecordingSize(st.SmallerRecordings)
+				}
+			})
+			settingRow(c, locales.SettingsPrivacyRecordFolder(), a.recordingsFolderDesc(st.RecordingsDir), false, func() {
+				mg.Row(c).Gap(sp2).AlignItems(mg.Center).Children(func() {
+					if st.RecordingsDir != "" && button(c.Key("rec-dir-reset"), locales.SettingsPrivacyRecordFolderReset(), btnOpt{}).Clicked() {
+						st.RecordingsDir = ""
+						a.changed()
+					}
+					if button(c.Key("rec-dir"), locales.SettingsPrivacyRecordFolderChoose(), btnOpt{}).Clicked() {
+						a.chooseRecordingsFolder(st.RecordingsDir)
+					}
+				})
+			})
 		}
 		settingRow(c, locales.SettingsPrivacyDeleteAll(), locales.SettingsPrivacyDeleteAllDesc(), true, func() {
 			b := button(c, locales.SettingsPrivacyDeleteButton(), btnOpt{})

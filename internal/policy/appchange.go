@@ -24,7 +24,7 @@ const (
 	RuleInstall = "Installing from the computer"
 	// RuleUninstall asks before every uninstall.
 	RuleUninstall = "Uninstalling apps"
-	// RulePinkyApps refuses to touch Pinky for Android and the iPhone's
+	// RulePinkyApps refuses to touch Pinky on the phone and the iPhone's
 	// helper (an XCTest runner, see IsPinkyApp), which give Pinky its access
 	// to the phone.
 	RulePinkyApps = "Pinky's own apps"
@@ -135,7 +135,7 @@ func (e *Engine) appChangeLocked(in Input) Verdict {
 		return deny(RuleFinance, "it is a finance app.")
 	case contains(cats, CatBlocked):
 		return deny(RuleBlocked, "you blocked it for agents.")
-	case len(in.ScopeApps) > 0 && !appIn(app, in.ScopeApps):
+	case scoped(in) && !appIn(app, in.ScopeApps):
 		return Verdict{Decision: Deny, Rule: RuleAgentScope, Scope: true,
 			Reason: fmt.Sprintf("%s is outside this agent's scope.", appName(app))}
 	case len(in.TaskApps) > 0 && !appIn(app, in.TaskApps):
@@ -164,9 +164,10 @@ func (e *Engine) appChangeLocked(in Input) Verdict {
 			}
 		}
 	}
-	if in.ReadOnly || e.readOnlyLocked(in.Device) {
+	if global := e.readOnlyLocked(in.Device); in.ReadOnly || global {
+		why, fix := readOnlyWhy(in, global)
 		return Verdict{Decision: Deny, Rule: RuleReadOnly,
-			Reason: "Read-only mode is on: agents cannot install, uninstall or stop apps."}
+			Reason: why + ": agents cannot install, uninstall or stop apps. " + fix}
 	}
 	if len(asks) == 0 {
 		return Verdict{Decision: Allow}

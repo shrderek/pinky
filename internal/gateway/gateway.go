@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/netip"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -16,6 +19,9 @@ import (
 	"github.com/DIYgod/pinky/internal/driver"
 	"github.com/DIYgod/pinky/internal/history"
 	"github.com/DIYgod/pinky/internal/policy"
+	"github.com/DIYgod/pinky/internal/secret"
+	"github.com/DIYgod/pinky/internal/tailnet"
+	"github.com/DIYgod/pinky/internal/traffic"
 )
 
 // Options configure a Gateway. Zero durations take the defaults in
@@ -43,6 +49,11 @@ type Options struct {
 	SettleMax        time.Duration // default 3 s
 	PollInterval     time.Duration // default 250 ms, for settling and phone_wait_for
 	DiscoverEvery    time.Duration // default 2 s
+	// SwitchGrace is how long after input to the phone, or the read that
+	// ended an action, a change of the app in front still counts as the
+	// input's doing, as a link may open its app late (appswitch.go);
+	// default 5 s, and a negative value means none (tests).
+	SwitchGrace time.Duration
 	// RulesEvery is how often the policy's files are checked for hand
 	// edits (policy.Engine.Refresh); default 2 s.
 	RulesEvery time.Duration
@@ -59,6 +70,28 @@ type Options struct {
 	// it through driver.Unlocker and forgets it. Nil means unlocking from
 	// the computer is not available.
 	PIN func(ctx context.Context, deviceID string) (string, error)
+
+	// Pinky's traffic capture (capture.go). TrafficPort is the proxy's
+	// port, default TrafficPort; TrafficSetupPort the port of its setup
+	// files (the certificate and the PAC file), default TrafficPort+1.
+	// TrafficCA is its certificate authority; nil loads (or makes) the one
+	// in DataDir, or one in memory without DataDir. TrafficKeys keeps that
+	// authority's private key (the macOS keychain); nil keeps it in a file
+	// in DataDir. TrafficTransport sends the requests on, nil directly.
+	// TrafficInterfaces lists this computer's addresses; nil asks the
+	// system. TrafficTailnet reads Tailscale on this computer, to tell a
+	// phone on the tailnet from one behind a carrier's NAT in the same
+	// range; nil takes no phone at a Tailscale address. TrafficDial
+	// replaces the proxy's own dial, and its refusal of this computer's
+	// addresses (tests).
+	TrafficPort       int
+	TrafficSetupPort  int
+	TrafficCA         *traffic.CA
+	TrafficKeys       secret.Store
+	TrafficTransport  http.RoundTripper
+	TrafficInterfaces func() ([]netip.Prefix, error)
+	TrafficTailnet    func(ctx context.Context) (tailnet.Status, error)
+	TrafficDial       func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	Logger *slog.Logger
 }
@@ -80,6 +113,9 @@ func (o *Options) defaults() {
 	set(&o.SettleMax, 3*time.Second)
 	set(&o.PollInterval, 250*time.Millisecond)
 	set(&o.DiscoverEvery, 2*time.Second)
+	if o.SwitchGrace == 0 {
+		o.SwitchGrace = 5 * time.Second
+	}
 	set(&o.RulesEvery, 2*time.Second)
 	if o.DefaultScope.Mode == "" {
 		o.DefaultScope = Scope{Mode: ScopeEverything}
@@ -122,16 +158,25 @@ type Gateway struct {
 	hubsClosed bool
 
 	// Guarded by mu.
-	recordOn   bool                      // record the screen of new tasks
-	background map[string]bool           // the person's choice per phone: agents on a background display, or not
-	removed    map[string]bool           // phones the person removed, kept off the list while listed over the network (remove.go)
-	paused     map[string]bool           // phones the person paused: listed, but not opened (pause.go)
-	known      map[string]bool           // phones that are the person's, which providers may open over Wi-Fi (wifi.go)
-	names      map[string]history.Device // what the history store calls the phones Pinky has seen (wifi.go)
-	chosen     map[string]string         // the connection the person chose per phone, none for Automatic (connection.go)
-	wifiOn     bool                      // the providers use phones over Wi-Fi (SetWiFi)
-	keepDays   int                       // history retention; 0 keeps everything
-	prune      chan struct{}             // asks the retention loop to run now
+	recordOn         bool                      // record the screen of new tasks
+	background       map[string]bool           // the person's choice per phone: agents on a background display, or not
+	removed          map[string]bool           // phones the person removed, kept off the list while listed over the network (remove.go)
+	removedUnplugged map[string]bool           // of those, the ones seen away from their cable since the removal: unlisted, or listed over Wi-Fi; in memory only, false after a restart (remove.go)
+	paused           map[string]bool           // phones the person paused: listed, but not opened (pause.go)
+	known            map[string]bool           // phones that are the person's, which providers may open over Wi-Fi (wifi.go)
+	names            map[string]history.Device // what the history store calls the phones Pinky has seen (wifi.go)
+	chosen           map[string]string         // the connection the person chose per phone, none for Automatic (connection.go)
+	started          map[string]bool           // virtual phones started with StartVirtual in this run, by platform and VirtualID (virtual.go)
+	wifiOn           bool                      // the providers use phones over Wi-Fi (SetWiFi)
+	keepDays         int                       // history retention; 0 keeps everything
+	// trafficOn lists the phones whose network traffic agents may read
+	// (traffic.go), trafficRoute the Android phones Pinky routes through
+	// itself during tasks (capture.go).
+	trafficOn    map[string]bool
+	trafficRoute map[string]bool
+	prune        chan struct{} // asks the retention loop to run now
+
+	cap captureState // Pinky's traffic proxy (capture.go)
 
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -139,6 +184,8 @@ type Gateway struct {
 	shots      running // history screenshots being taken or confirmed
 	videos     running // task recordings, until their files are closed
 	videoStops running // recordings being finished
+	shrink     shrinker
+	shrinks    running // recordings waiting to be made smaller, or being made (shrink.go)
 	closed     bool
 }
 
@@ -149,22 +196,26 @@ var _ API = (*Gateway)(nil)
 func New(o Options) (*Gateway, error) {
 	o.defaults()
 	g := &Gateway{
-		opt:        o,
-		log:        o.Logger,
-		policy:     o.Policy,
-		devices:    map[string]*device{},
-		sessions:   map[string]*Session{},
-		agents:     map[string]*agentState{},
-		apSteps:    map[string]stepRef{},
-		subs:       map[chan Event]struct{}{},
-		hubs:       map[string]*hub{},
-		background: map[string]bool{},
-		removed:    map[string]bool{},
-		paused:     map[string]bool{},
-		known:      map[string]bool{},
-		names:      map[string]history.Device{},
-		chosen:     map[string]string{},
-		prune:      make(chan struct{}, 1),
+		opt:              o,
+		log:              o.Logger,
+		policy:           o.Policy,
+		devices:          map[string]*device{},
+		sessions:         map[string]*Session{},
+		agents:           map[string]*agentState{},
+		apSteps:          map[string]stepRef{},
+		subs:             map[chan Event]struct{}{},
+		hubs:             map[string]*hub{},
+		background:       map[string]bool{},
+		removed:          map[string]bool{},
+		removedUnplugged: map[string]bool{},
+		paused:           map[string]bool{},
+		known:            map[string]bool{},
+		names:            map[string]history.Device{},
+		chosen:           map[string]string{},
+		started:          map[string]bool{},
+		prune:            make(chan struct{}, 1),
+		trafficOn:        map[string]bool{},
+		trafficRoute:     map[string]bool{},
 	}
 	if g.policy == nil {
 		g.policy = policy.Default()
@@ -175,10 +226,30 @@ func New(o Options) (*Gateway, error) {
 			return nil, fmt.Errorf("history: %w", err)
 		}
 		g.store = st
+		// What ran when the Pinky before this one crashed or was killed
+		// ended as when a gateway stops in order (Close), and the
+		// approvals it left open are taken back.
+		if n, err := st.EndUnfinished(context.Background(), string(stateForOutcome(outcomeGatewayStopped)),
+			outcomeGatewayStopped, OutcomeDisconnected, "withdrawn"); err != nil {
+			g.log.Warn("history: unfinished tasks", "err", err)
+		} else if n > 0 {
+			g.log.Info("history: ended the tasks a Pinky that did not stop in order left running", "tasks", n)
+		}
+		// An action the person had allowed and that was under way then
+		// may have happened or not.
+		if _, err := st.EndAllowedSteps(context.Background(), string(StatusPending), string(StatusUncertain),
+			string(approval.AllowOnce), string(approval.AllowTask), string(approval.AllowAlways)); err != nil {
+			g.log.Warn("history: allowed steps", "err", err)
+		}
 		if bg, err := st.BackgroundDevices(context.Background()); err == nil {
 			g.background = bg
 		} else {
 			g.log.Warn("history: background displays", "err", err)
+		}
+		if on, route, err := st.TrafficDevices(context.Background()); err == nil {
+			g.trafficOn, g.trafficRoute = on, route
+		} else {
+			g.log.Warn("history: network traffic", "err", err)
 		}
 		// How the person chose to connect each phone, before the first
 		// discovery opens it.
@@ -197,13 +268,15 @@ func New(o Options) (*Gateway, error) {
 		OnExpire: g.approvalExpired,
 	})
 	g.rec = newRecorder(g.log)
+	g.initCapture()
 	g.ctx, g.cancel = context.WithCancel(context.Background())
 
 	ctx, cancel := context.WithTimeout(g.ctx, 10*time.Second)
 	g.discover(ctx)
 	cancel()
 
-	g.wg.Add(4)
+	g.wg.Add(5)
+	go g.captureLoop()
 	go g.discoverLoop()
 	go g.idleLoop()
 	go g.retentionLoop()
@@ -225,11 +298,14 @@ func (g *Gateway) Close() error {
 	}
 	g.mu.Unlock()
 	for _, s := range sessions {
-		s.end("gateway stopped", false)
+		s.end(outcomeGatewayStopped, false)
 	}
 	g.mu.Lock()
-	g.endKeptLocked("gateway stopped", false)
+	g.endKeptLocked(outcomeGatewayStopped, false)
 	g.mu.Unlock()
+	// The proxy stops and the phones' proxy settings go back, while the
+	// providers still reach the phones.
+	g.stopCapture()
 	g.approvals.Close()
 	g.cancel()
 	// Recordings close their files, which needs the history queue.
@@ -329,15 +405,19 @@ func (g *Gateway) discover(ctx context.Context) {
 	// opens run outside the turn: a pass waits for another's listing, not
 	// for its opens.
 	g.listMu.Lock()
+	seenAll := map[string]bool{}
+	listFailed := false
 	for _, p := range g.opt.Providers {
 		infos, err := p.List(ctx)
 		if err != nil {
 			g.log.Warn("list devices", "platform", p.Platform(), "err", err)
+			listFailed = true
 			continue
 		}
 		seen := map[string]bool{}
 		for _, info := range infos {
 			seen[info.ID] = true
+			seenAll[info.ID] = true
 			if d := g.updateDevice(p, info); d != nil {
 				wg.Add(1)
 				go func() {
@@ -348,7 +428,7 @@ func (g *Gateway) discover(ctx context.Context) {
 		}
 		g.mu.Lock()
 		var gone []*device
-		var left []string
+		var left, forgot []string
 		now := time.Now()
 		for id, d := range g.devices {
 			if d.provider != p || seen[id] {
@@ -382,6 +462,16 @@ func (g *Gateway) discover(ctx context.Context) {
 				delete(g.devices, id)
 				left = append(left, id)
 				g.log.Info("device forgotten", "device", id, "why", "never opened, and no longer listed")
+			case emulator(d.info) && !d.opening && d.lease == nil && now.Sub(d.unlistedAt) >= emulatorGrace && !g.keepEmulatorLocked(d):
+				// An emulator that went away, with nothing to keep for
+				// it: its next run is likely another phone
+				// (emulatorGrace).
+				d.removed = true
+				g.dropSettingsLocked(id)
+				forgetTaskWay(d)
+				forgot = append(forgot, id)
+				left = append(left, id)
+				g.log.Info("device forgotten", "device", id, "why", "an emulator, no longer listed")
 			case unlisted(d):
 				left = append(left, id)
 			}
@@ -390,9 +480,26 @@ func (g *Gateway) discover(ctx context.Context) {
 		for _, d := range gone {
 			g.setOffline(d, "the phone disconnected")
 		}
+		for _, id := range forgot {
+			g.forgetSettings(p, id)
+		}
 		for _, id := range left {
 			g.emit(Event{Kind: EventDevices, DeviceID: id})
 		}
+	}
+	// A removed phone no provider listed this pass has left its cable:
+	// its next plug-in is the person's doing (updateDevice). A pass with
+	// a failed listing says nothing about that provider's phones, so it
+	// marks nothing: one hiccup must not unplug a phone that never left
+	// its cable.
+	if !listFailed {
+		g.mu.Lock()
+		for id := range g.removed {
+			if !seenAll[id] {
+				g.removedUnplugged[id] = true
+			}
+		}
+		g.mu.Unlock()
 	}
 	g.listMu.Unlock()
 	wg.Wait()
@@ -403,6 +510,36 @@ func (g *Gateway) discover(ctx context.Context) {
 // long enough for a phone that restarts while it is set up (Developer
 // Mode) to come back as itself. A variable for tests.
 var unopenedGrace = 2 * time.Minute
+
+// emulatorGrace is how long an Android emulator that its provider no
+// longer lists stays on the list, offline, before it is forgotten with its
+// settings (its history stays). An emulator is listed by its adb serial,
+// which names the port it runs on, so its next run is often another phone:
+// the ones Pinky kept would pile up offline, a hundred a day for a test
+// farm. One that comes back later is listed again as new. A variable for
+// tests.
+var emulatorGrace = 10 * time.Minute
+
+// emulator reports whether the phone is an Android emulator. An iOS
+// Simulator keeps its UDID from run to run and stays.
+func emulator(info driver.Info) bool {
+	return info.Virtual && info.Platform == driver.Android
+}
+
+// keepEmulatorLocked reports whether a gone emulator stays on the list
+// all the same: Pinky started its AVD in this run, which runs again on the
+// same port and so as the same phone (Add phone's Start), or the person
+// gave it settings of its own (agents on a background display or not, a
+// connection, read-only). Its saved PIN is the client's, which forgetting
+// does not delete. The caller holds g.mu.
+func (g *Gateway) keepEmulatorLocked(d *device) bool {
+	if d.info.VirtualID != "" && g.started[virtualKey(d.info.Platform, d.info.VirtualID)] {
+		return true
+	}
+	_, background := g.background[d.id]
+	_, chosen := g.chosen[d.id]
+	return background || chosen || g.policy.ReadOnly(d.id)
+}
 
 // unlisted marks a phone its provider no longer lists, and that the
 // gateway has not opened, as offline: it went away while it waited for a
@@ -432,11 +569,21 @@ func (g *Gateway) updateDevice(p driver.Provider, info driver.Info) *device {
 			// The person removed it; the provider lists it over the
 			// network by itself, or it is a Simulator or an emulator
 			// they run for other work. It is back once they start or use
-			// it from Add phone (StartVirtual).
+			// it from Add phone (StartVirtual). Listed over Wi-Fi, it
+			// has left its cable: a later plug-in adds it back.
+			g.removedUnplugged[info.ID] = true
 			g.mu.Unlock()
 			return nil
 		}
-		// Plugged in: the person adds it back.
+		if !g.removedUnplugged[info.ID] {
+			// Still on the cable it was removed from: a phone kept
+			// plugged in, such as an iPhone charging from the computer,
+			// is not the person adding it back (pausedListedLocked).
+			g.mu.Unlock()
+			return nil
+		}
+		// Seen away from its cable since the removal: plugging it in is
+		// the person adding it back.
 		g.addedBackLocked(info.ID)
 	}
 	d, ok := g.devices[info.ID]
@@ -741,10 +888,12 @@ func (g *Gateway) watchedDevices() map[string]bool {
 // and about idle ones every idleLockEvery (idleLockEveryWiFi over Wi-Fi
 // with nobody watching). A locked device whose driver cannot report locks
 // is read instead, so the unlock card goes away when the person unlocks.
+// An idle device that a mirror watches has its screen read too
+// (checkScreen), so a screen off without a lock screen says so.
 func (g *Gateway) pollLocks(ctx context.Context) {
 	watched := g.watchedDevices()
 	g.mu.Lock()
-	var report, read []*device
+	var report, read, screens, unwatched []*device
 	now := time.Now()
 	for _, d := range g.devices {
 		if d.dev == nil || !d.online {
@@ -755,9 +904,19 @@ func (g *Gateway) pollLocks(ctx context.Context) {
 			if !watched[d.id] && d.dev.Info().Connection == "wifi" {
 				every = idleLockEveryWiFi
 			}
-			if _, ok := d.dev.(driver.LockReporter); ok && now.Sub(d.lockReadAt) >= every {
+			_, reports := d.dev.(driver.LockReporter)
+			_, wakes := d.dev.(driver.Waker)
+			if (reports || wakes && watched[d.id]) && now.Sub(d.lockReadAt) >= every {
 				d.lockReadAt = now
-				report = append(report, d)
+				if reports {
+					report = append(report, d)
+				}
+				if wakes && watched[d.id] {
+					screens = append(screens, d)
+				}
+			}
+			if d.screenOff && !watched[d.id] {
+				unwatched = append(unwatched, d)
 			}
 			continue
 		}
@@ -770,6 +929,13 @@ func (g *Gateway) pollLocks(ctx context.Context) {
 	g.mu.Unlock()
 	for _, d := range report {
 		g.checkLock(ctx, d)
+	}
+	for _, d := range screens {
+		g.checkScreen(ctx, d)
+	}
+	for _, d := range unwatched {
+		// Nobody looks, so nothing keeps it current.
+		g.setScreenOff(d, false)
 	}
 	for _, d := range read {
 		g.observe(ctx, d, false)
@@ -799,6 +965,12 @@ func (g *Gateway) checkLock(ctx context.Context, d *device) {
 // computer does end the handoffs opened for the lock (see Unlock).
 func (g *Gateway) setLocked(d *device, locked bool) {
 	g.mu.Lock()
+	g.setLockedLocked(d, locked)
+}
+
+// setLockedLocked is setLocked with g.mu held, which it releases.
+func (g *Gateway) setLockedLocked(d *device, locked bool) {
+	d.lockSeq++
 	if d.locked == locked {
 		g.mu.Unlock()
 		return
@@ -838,7 +1010,7 @@ func (g *Gateway) screenOfLocked(d *device) (driver.Device, bool) {
 
 // noteWorkLocked tells the phone's driver whether an agent works on it, a
 // task running while the person is not in control, when that changed
-// (driver.WorkWatcher). Pinky for Android's accessibility service is on
+// (driver.WorkWatcher). Pinky on the phone's accessibility service is on
 // only while one does.
 func (g *Gateway) noteWorkLocked(d *device) {
 	ww, ok := d.dev.(driver.WorkWatcher)

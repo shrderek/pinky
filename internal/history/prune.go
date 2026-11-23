@@ -71,7 +71,69 @@ func (s *Store) Prune(ctx context.Context, cutoff time.Time, keep []string) (Pru
 	if err := tx.Commit(); err != nil {
 		return out, err
 	}
-	return out, removeFiles(files)
+	return out, errors.Join(s.removePending(ctx), s.removeDropped(ctx, files))
+}
+
+// DeleteTasks deletes the tasks ids names, with their steps, approvals,
+// screenshots and recordings, and the sessions they leave without a task
+// once those ended, as the person asks from a task's detail in Activity.
+// Tasks in keep stay: the ones still running. A screenshot another task's
+// step still shows stays too. An id the store does not have is no error.
+func (s *Store) DeleteTasks(ctx context.Context, ids, keep []string) (Pruned, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out Pruned
+	skip := map[string]bool{}
+	for _, k := range keep {
+		skip[k] = true
+	}
+	var del []string
+	for _, id := range ids {
+		if id != "" && !skip[id] {
+			skip[id] = true // once
+			del = append(del, id)
+		}
+	}
+	if len(del) == 0 {
+		return out, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback()
+	var sessions []string
+	for _, chunk := range chunks(del, 500) {
+		in, cargs := inList(chunk)
+		ss, err := txStrings(ctx, tx, `SELECT DISTINCT session_id FROM tasks WHERE id IN (`+in+`) AND session_id != ''`, cargs...)
+		if err != nil {
+			return out, err
+		}
+		sessions = append(sessions, ss...)
+	}
+	candidates, files, err := s.dropTasks(ctx, tx, del, &out)
+	if err != nil {
+		return out, err
+	}
+	media, err := s.dropMedia(ctx, tx, candidates, &out)
+	if err != nil {
+		return out, err
+	}
+	files = append(files, media...)
+	for _, chunk := range chunks(sessions, 500) {
+		in, cargs := inList(chunk)
+		res, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id IN (`+in+`) AND ended_at != 0
+			AND id NOT IN (SELECT session_id FROM tasks)`, cargs...)
+		if err != nil {
+			return out, err
+		}
+		n, _ := res.RowsAffected()
+		out.Sessions += int(n)
+	}
+	if err := tx.Commit(); err != nil {
+		return out, err
+	}
+	return out, errors.Join(s.removePending(ctx), s.removeDropped(ctx, files))
 }
 
 // dropTasks deletes tasks with their steps, approvals and recordings in tx,
@@ -111,11 +173,11 @@ func (s *Store) dropTasks(ctx context.Context, tx *sql.Tx, ids []string, out *Pr
 		if err != nil {
 			return nil, nil, err
 		}
-		for _, rel := range recs {
-			if !strings.Contains(rel, "..") {
-				files = append(files, filepath.Join(s.dir, filepath.FromSlash(rel)))
-			}
+		recFiles, err := s.dropRecordingFiles(ctx, tx, recs)
+		if err != nil {
+			return nil, nil, err
 		}
+		files = append(files, recFiles...)
 		out.Recordings += len(recs)
 		for _, del := range []struct {
 			table string
@@ -170,14 +232,18 @@ func (s *Store) dropMedia(ctx context.Context, tx *sql.Tx, candidates map[string
 	return files, nil
 }
 
-// removeFiles removes files whose rows are gone; one already gone is fine.
-func removeFiles(files []string) error {
+// removeEach removes files whose rows are gone; one already gone is fine.
+// It tries every file, so one that cannot be removed leaves no other
+// behind, and returns those it could not remove, with their errors.
+func removeEach(files []string) (failed []string, err error) {
+	var errs []error
 	for _, f := range files {
 		if err := os.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+			failed = append(failed, f)
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return failed, errors.Join(errs...)
 }
 
 func (s *Store) strings(ctx context.Context, q string, args ...any) ([]string, error) {

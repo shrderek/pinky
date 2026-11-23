@@ -204,11 +204,33 @@ type Screen struct {
 	// Covered lists other parts of the screen where system windows lie
 	// over the app and take touches, such as the status and navigation
 	// bars, when the driver can tell.
-	Covered    []Rect
-	Locked     bool
+	Covered []Rect
+	Locked  bool
+	// Partial says that the read ended before it had every element: the
+	// phone answered too slowly, or the screen has more than a read
+	// takes. Elements may be missing, so an element that is not listed
+	// is not thereby gone. The header says "partial".
+	Partial    bool
 	Elements   []Element
 	Events     []Event
 	CapturedAt time.Time
+	// Unsettled: the screen kept changing, so the driver could not read
+	// its element tree (Android's uiautomator waits for the screen to stop
+	// changing). Elements then hold only what OCR read from a picture, if
+	// anything; the app, lock and keyboard state are still known.
+	Unsettled bool
+	// AppHidden: the phone gave the driver no accessibility window of the
+	// app in front (ColorOS keeps WeChat's from accessibility services,
+	// GitHub issue #191), so the app is named from the window manager and
+	// the tree has none of its elements. Elements hold other windows'
+	// nodes and what OCR read from a picture, if anything.
+	AppHidden bool
+	// TreeTooSlow: the phone did not give the element tree in time (an
+	// iPhone through WebDriverAgent on a screen whose tree takes it tens
+	// of seconds, such as a long React Native list), so Elements hold only
+	// what OCR read from a picture, if anything; the app and lock state
+	// are still known when the phone said them.
+	TreeTooSlow bool
 }
 
 // Find returns the element with the given ref.
@@ -255,8 +277,20 @@ func (s *Screen) Header() string {
 	} else {
 		parts = append(parts, "keyboard hidden")
 	}
+	if s.Unsettled {
+		parts = append(parts, "still changing: no element tree")
+	}
+	if s.AppHidden {
+		parts = append(parts, "app hidden from accessibility: OCR text only")
+	}
+	if s.TreeTooSlow {
+		parts = append(parts, "element tree too slow: OCR text only")
+	}
 	if f, ok := s.Focused(); ok && f.Ref != 0 {
 		parts = append(parts, fmt.Sprintf("focus [%d]", f.Ref))
+	}
+	if s.Partial {
+		parts = append(parts, "partial")
 	}
 	return strings.Join(parts, " · ")
 }

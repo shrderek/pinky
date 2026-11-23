@@ -501,11 +501,11 @@ func drawEnlarge(pt *mg.Painter, r, away mg.Rect, strong bool) {
 // missingShot says why an approval about the screen has no screenshot:
 // the phone is locked, Pinky takes none of a blocked app, or the phone
 // sent none. It is empty for approvals that are about no screen: copying
-// files, giving the agent a recording, reading an app's logs, and the agent's own questions and
+// files, giving the agent a recording, reading an app's logs or network traffic, and the agent's own questions and
 // first connection.
 func (a *app) missingShot(n gateway.NeedView) (string, *mg.SVG) {
 	if n.Screenshot != nil || n.Kind != gateway.NeedApproval || newAgentNeed(n) || n.Rule == "Agent request" || n.Rule == "Files" ||
-		n.Rule == "Recordings" || n.Rule == "App logs" {
+		n.Rule == "Recordings" || n.Rule == "App logs" || n.Rule == "Network traffic" {
 		return "", nil
 	}
 	if d := a.device(n.DeviceID); d != nil && a.isLocked(*d) {
@@ -538,7 +538,7 @@ func (a *app) missingShotNote(c *mg.Context, n gateway.NeedView) {
 	}
 	p := pal(c)
 	mg.Row(c).Margin(12, 0, 0, 0).Padding(9, 12).Radius(10).Background(trayColor(p)).Gap(8).AlignItems(mg.Center).Children(func() {
-		mg.Icon(c, ic).FontSize(16).TextColor(p.ink3).Shrink(0)
+		mg.Icon(c, ic).FontSize(iconBody).TextColor(p.ink3).Shrink(0)
 		mg.Text(c, text).FontSize(fsSmall).TextColor(p.ink2).MaxLines(2)
 	})
 }
@@ -572,7 +572,7 @@ func (a *app) shotViewer(c *mg.Context, n gateway.NeedView, w, h float32, fill b
 				b.Background(p.bg3)
 				ink = p.ink
 			}
-			b.TextColor(ink).Children(func() { mg.Icon(c, icX).FontSize(17) })
+			b.TextColor(ink).Children(func() { mg.Icon(c, icX).FontSize(iconBody) })
 			if b.Clicked() {
 				close()
 			}

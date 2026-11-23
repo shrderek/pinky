@@ -46,12 +46,13 @@ func (a *app) setPaused(d gateway.DeviceView, paused bool) {
 	}()
 }
 
-// hasPhoneMenu reports whether a phone's right-click menu has anything.
-func (a *app) hasPhoneMenu() bool { return a.canPause() || a.canRemove() }
-
 // phoneMenu is a phone's right-click menu, in the sidebar and on its tile
-// in All phones: pause or resume it, and remove it.
+// in All phones: open it in a window of its own, pause or resume it, and
+// remove it.
 func (a *app) phoneMenu(m *mg.Menu, d gateway.DeviceView) {
+	if m.Item(locales.PhoneOpenWindow()).Chosen() {
+		a.openPhoneWindow(d.Info.ID)
+	}
 	if a.canPause() {
 		label := locales.PausePhoneMenu()
 		if d.Paused {
@@ -71,7 +72,7 @@ func (a *app) pausedPage(c *mg.Context, d gateway.DeviceView) {
 	p := pal(c)
 	mg.Column(c).AlignItems(mg.Center).Gap(12).MaxWidth(420).Children(func() {
 		mg.Box(c).Size(200, 420).Radius(32).Border(2, p.line2).Background(p.bg2).Center().Children(func() {
-			mg.Icon(c, icPause).FontSize(30).TextColor(p.ink3)
+			mg.Icon(c, icPause).FontSize(iconHero).TextColor(p.ink3)
 		})
 		mg.Text(c, locales.PhonePausedTitle(d.Info.Name)).FontSize(fsTitle3).FontWeight(fwSemibold)
 		mg.Text(c, locales.PhonePausedDetail()).FontSize(fsSmall).TextColor(p.ink2).TextAlign(mg.Center)
@@ -91,10 +92,14 @@ func (a *app) pauseMenuItem(c *mg.Context, d gateway.DeviceView, close func()) {
 	p := pal(c)
 	b := mg.ButtonBase(c.Key("pause-"+d.Info.ID)).Label(locales.PausePhoneMenu()).MinHeight(36).Padding(sp2, 10).Radius(rSmall).
 		AlignItems(mg.Center).Justify(mg.Start)
-	if b.Hovered() || b.Focused() {
+	switch {
+	case b.Pressed():
+		b.Background(p.sel)
+	case b.Hovered() || b.Focused():
 		b.Background(p.bg3)
 	}
-	b.Children(func() { menuText(c, locales.PausePhoneMenu(), locales.PausePhoneMenuDesc(), p.ink) })
+	fillFade(b)
+	b.Children(func() { menuText(c, icPause, locales.PausePhoneMenu(), locales.PausePhoneMenuDesc(), p.ink) })
 	if b.Clicked() {
 		close()
 		a.setPaused(d, true)

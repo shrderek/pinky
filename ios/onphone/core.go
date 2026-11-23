@@ -15,8 +15,18 @@
 //	{"cmd":"decide","need":"...","decision":"allow_once"} → {"ok":true}; back to the task's app first
 //	{"cmd":"preset","preset":1} / {"cmd":"stop"} / {"cmd":"dismiss"} → {"ok":true}
 //	{"cmd":"ui","on":true}                  → {"ok":true}  (Pinky's app came to the front or left)
-//	{"cmd":"history","search":"","before_ms":0,"limit":50} → {"ok":true,"history":[...]}
+//	{"cmd":"history","before_ms":0,"limit":20} → {"ok":true,"history":[...],"more":true}  (standalone.PastTask, newest first)
+//	{"cmd":"history","id":"..."}             → {"ok":true,"history":[{...,"steps":[...]}]}, or the code gone
 //	{"cmd":"info"}                          → {"ok":true,"info":{...}}
+//	{"cmd":"steer","text":"..."}             → {"ok":true,"id":"m1"}  (a message to the running task)
+//	{"cmd":"steer","id":"m1","text":"..."}   → {"ok":true}  (edits it before Pinky reads it; empty text withdraws)
+//	{"cmd":"withdraw","id":"m1"}             → {"ok":true}
+//	{"cmd":"continue","text":"...","key":"..."} → {"ok":true}  (carries on the task that ended); leaves Pinky's app first
+//	{"cmd":"check","service":"...","key":"...",...} → {"ok":true,"check":{...}}  (pilot.CheckResult; a minute at most)
+//	{"cmd":"usage","since":"2006-01-02"}    → {"ok":true,"usage":[...]}  (pilot.UsageRow, newest first)
+//	{"cmd":"memories"}, {"cmd":"memory_add","text":"..."}, {"cmd":"memory_edit","id":"...","text":"..."},
+//	{"cmd":"memory_delete","id":"..."}, {"cmd":"memory_delete_all"} → {"ok":true,"memories":[...]}  (standalone.MemoryState, newest first)
+//	{"cmd":"keep","index":0} / {"cmd":"drop","index":0} → {"ok":true}  (a note the task suggested: AgentState.Suggested)
 //
 // reason, when the phone is not ready, says why in a word Pinky's screens
 // put into the person's language: one of the Reason constants.
@@ -24,7 +34,10 @@
 // A failed command replies {"ok":false,"error":"...","code":"..."}, where
 // code, when set, is what Pinky's screens put into words: no_device,
 // no_key, no_task, no_model, busy, computer (Pinky on a computer uses the
-// phone: claims.go) or gone (the need was answered or expired).
+// phone: claims.go) or gone (the need was answered or expired), and for
+// the person's messages empty, not_running, read, no_message and
+// cannot_continue, and for the notes memory_sensitive, memory_long,
+// memory_full, memory_empty or memory_gone (standalone's Code constants).
 //
 // The key a task starts with stays in memory until the task ends. Nothing
 // here logs a request.
@@ -203,32 +216,30 @@ type request struct {
 	Decision  string `json:"decision"`
 	Note      string `json:"note"`
 	Preset    int    `json:"preset"`
-	Search    string `json:"search"`
+	ID        string `json:"id"`
 	BeforeMS  int64  `json:"before_ms"`
 	Limit     int    `json:"limit"`
+	Text      string `json:"text"`  // steer and continue: the person's message; a note's words
+	Since     string `json:"since"` // usage: the first day, 2006-01-02
+	Index     int    `json:"index"` // keep, drop: which suggestion
 	standalone.StartRequest
 }
 
 type reply struct {
-	OK      bool            `json:"ok"`
-	Error   string          `json:"error,omitempty"`
-	Code    string          `json:"code,omitempty"`
-	Rev     uint64          `json:"rev,omitempty"`
-	State   json.RawMessage `json:"state,omitempty"`
-	Reason  string          `json:"reason,omitempty"`
-	History []HistoryTask   `json:"history,omitempty"`
-	Info    *Info           `json:"info,omitempty"`
-}
-
-// HistoryTask is a task in history.
-type HistoryTask struct {
-	ID        string            `json:"id"`
-	Title     string            `json:"title"`
-	Agent     string            `json:"agent"`
-	State     string            `json:"state"`
-	StartedMS int64             `json:"started_ms"`
-	EndedMS   int64             `json:"ended_ms,omitempty"`
-	Steps     []standalone.Step `json:"steps"`
+	OK      bool                  `json:"ok"`
+	Error   string                `json:"error,omitempty"`
+	Code    string                `json:"code,omitempty"`
+	Rev     uint64                `json:"rev,omitempty"`
+	State   json.RawMessage       `json:"state,omitempty"`
+	Reason  string                `json:"reason,omitempty"`
+	History []standalone.PastTask `json:"history,omitempty"`
+	More    bool                  `json:"more,omitempty"`
+	Info    *Info                 `json:"info,omitempty"`
+	ID      string                `json:"id,omitempty"` // steer: the new message's
+	Check   *pilot.CheckResult    `json:"check,omitempty"`
+	Usage   *[]pilot.UsageRow     `json:"usage,omitempty"`
+	// Memories answers the notes' commands, empty or not.
+	Memories *[]standalone.MemoryState `json:"memories,omitempty"`
 }
 
 // Info is the connection as the core sees it, for diagnostics.
@@ -284,6 +295,44 @@ func (c *Core) handle(r request) reply {
 		return c.history(ctx, r)
 	case "info":
 		return reply{OK: true, Info: c.info()}
+	case "steer":
+		if r.ID != "" {
+			if err := c.sc.EditMessage(r.ID, r.Text); err != nil {
+				return fail(standalone.Code(err), err)
+			}
+			break
+		}
+		m, err := c.sc.Steer(r.Text)
+		if err != nil {
+			return fail(standalone.Code(err), err)
+		}
+		c.poke()
+		return reply{OK: true, ID: m.ID}
+	case "withdraw":
+		if err := c.sc.Withdraw(r.ID); err != nil {
+			return fail(standalone.Code(err), err)
+		}
+	case "continue":
+		return c.continueTask(ctx, r.Text, r.Key)
+	case "check":
+		res := c.sc.Check(r.StartRequest)
+		return reply{OK: true, Check: &res}
+	case "usage":
+		rows := c.sc.Usage(r.Since)
+		if rows == nil {
+			rows = []pilot.UsageRow{}
+		}
+		return reply{OK: true, Usage: &rows}
+	case "memories", "memory_add", "memory_edit", "memory_delete", "memory_delete_all":
+		return c.memories(r)
+	case "keep", "drop":
+		decide := c.sc.Keep
+		if r.Cmd == "drop" {
+			decide = c.sc.Drop
+		}
+		if err := decide(r.Index); err != nil {
+			return fail(standalone.MemoryCode(err), err)
+		}
 	default:
 		return fail("", fmt.Errorf("unknown command %q", r.Cmd))
 	}
@@ -317,7 +366,7 @@ var (
 func (c *Core) start(ctx context.Context, r standalone.StartRequest) reply {
 	d := c.prov.phone()
 	st := c.sc.State()
-	cfg := pilot.Config{Provider: r.Provider, Model: r.Model}.Normalize()
+	cfg := r.Config().Normalize()
 	switch {
 	case d == nil || !st.Device.Ready:
 		return fail("no_device", errNoDevice)
@@ -325,7 +374,7 @@ func (c *Core) start(ctx context.Context, r standalone.StartRequest) reply {
 		return fail("no_task", pilot.ErrNoTask)
 	case cfg.Model == "":
 		return fail("no_model", pilot.ErrNoModel)
-	case strings.TrimSpace(r.Key) == "":
+	case strings.TrimSpace(r.Key) == "" && !cfg.KeyOptional():
 		return fail("no_key", standalone.ErrNoKey)
 	case st.Agent != nil && st.Agent.Running:
 		return fail("busy", errBusy)
@@ -347,9 +396,46 @@ func (c *Core) start(ctx context.Context, r standalone.StartRequest) reply {
 		}
 		return fail(code, err)
 	}
-	c.log.Info("task started", "provider", cfg.Provider, "model", cfg.Model)
+	c.log.Info("task started", "service", cfg.Service, "provider", cfg.Provider, "model", cfg.Model)
 	// The next publish that finds the task ended logs how, also when it
 	// ended before any publish saw it run.
+	c.mu.Lock()
+	c.started = true
+	c.mu.Unlock()
+	c.poke()
+	return reply{OK: true}
+}
+
+// continueTask carries on the task that ended with the person's message.
+// Like start, it checks what can fail first, then leaves Pinky's app.
+func (c *Core) continueTask(ctx context.Context, text, key string) reply {
+	d := c.prov.phone()
+	st := c.sc.State()
+	switch {
+	case d == nil || !st.Device.Ready:
+		return fail("no_device", errNoDevice)
+	case strings.TrimSpace(key) == "" && (st.Agent == nil || !st.Agent.KeyOptional):
+		return fail("no_key", standalone.ErrNoKey)
+	case st.Agent != nil && st.Agent.Running:
+		return fail("busy", errBusy)
+	case st.Agent == nil || !st.Agent.Continuable:
+		return fail(standalone.CodeCannotContinue, pilot.ErrCannotContinue)
+	case strings.TrimSpace(text) == "" && len(st.Agent.Pending) == 0:
+		return fail(standalone.CodeEmpty, pilot.ErrEmpty)
+	case st.Computer != nil:
+		return fail(standalone.CodeComputer, standalone.ErrComputer)
+	}
+	if err := c.leave(ctx, d); err != nil {
+		return fail("", fmt.Errorf("leave Pinky: %w", err))
+	}
+	if err := c.sc.Continue(text, key); err != nil {
+		code := standalone.Code(err)
+		if errors.Is(err, standalone.ErrNoDevice) {
+			err = errNoDevice
+		}
+		return fail(code, err)
+	}
+	c.log.Info("task continued")
 	c.mu.Lock()
 	c.started = true
 	c.mu.Unlock()
@@ -422,32 +508,55 @@ func (c *Core) leftAfter(ctx context.Context) {
 	}
 }
 
+// memories changes the notes as r says and replies with them, as
+// standalone's commands of the same names.
+func (c *Core) memories(r request) reply {
+	var err error
+	switch r.Cmd {
+	case "memory_add":
+		err = c.sc.AddMemory(r.Text)
+	case "memory_edit":
+		err = c.sc.EditMemory(r.ID, r.Text)
+	case "memory_delete":
+		err = c.sc.DeleteMemory(r.ID)
+	case "memory_delete_all":
+		err = c.sc.DeleteAllMemories()
+	}
+	if err != nil {
+		return fail(standalone.MemoryCode(err), err)
+	}
+	list := c.sc.Memories()
+	return reply{OK: true, Memories: &list}
+}
+
+// history answers Activity as Android's app gets it (standalone's history
+// command): the tasks that ended, a page at a time, or one with its steps.
 func (c *Core) history(ctx context.Context, r request) reply {
-	q := gateway.HistoryQuery{Search: r.Search, Limit: r.Limit}
+	ctx, cancel := context.WithTimeout(ctx, historyWait)
+	defer cancel()
+	if r.ID != "" {
+		t, err := c.sc.PastTask(ctx, r.ID)
+		if errors.Is(err, standalone.ErrGone) {
+			return fail(standalone.CodeGone, err)
+		}
+		if err != nil {
+			return fail("", err)
+		}
+		return reply{OK: true, History: []standalone.PastTask{t}}
+	}
+	var before time.Time
 	if r.BeforeMS > 0 {
-		q.Before = time.UnixMilli(r.BeforeMS)
+		before = time.UnixMilli(r.BeforeMS)
 	}
-	if q.Limit <= 0 || q.Limit > 200 {
-		q.Limit = 50
-	}
-	tasks, err := c.sc.G.History(ctx, q)
+	list, more, err := c.sc.History(ctx, before, r.Limit)
 	if err != nil {
 		return fail("", err)
 	}
-	out := make([]HistoryTask, 0, len(tasks))
-	for _, t := range tasks {
-		h := HistoryTask{ID: t.ID, Title: t.Title, Agent: t.Agent, State: string(t.State),
-			StartedMS: t.Started.UnixMilli(), Steps: []standalone.Step{}}
-		if !t.Ended.IsZero() {
-			h.EndedMS = t.Ended.UnixMilli()
-		}
-		for _, s := range t.Steps {
-			h.Steps = append(h.Steps, standalone.Step{Text: s.Text, Status: s.Status, MS: s.Elapsed.Milliseconds()})
-		}
-		out = append(out, h)
-	}
-	return reply{OK: true, History: out}
+	return reply{OK: true, History: list, More: more}
 }
+
+// historyWait bounds a read of Activity.
+const historyWait = 10 * time.Second
 
 func (c *Core) info() *Info {
 	in := &Info{UI: c.gate.uiActive()}

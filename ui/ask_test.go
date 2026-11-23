@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -9,6 +11,7 @@ import (
 
 	mg "github.com/egoist/mygo/ui"
 
+	"github.com/DIYgod/pinky/cmd/pinky/locales"
 	"github.com/DIYgod/pinky/internal/gateway"
 	"github.com/DIYgod/pinky/internal/pilot"
 	"github.com/DIYgod/pinky/internal/secret"
@@ -22,22 +25,66 @@ type fakePilot struct {
 	started []fakeStart
 	stopped []string
 	status  map[string]pilot.Status
+	seq     int
+	cont    []string // the texts Continue was given
+	mem     *pilot.Memories
 }
 
 type fakeStart struct {
 	cfg          pilot.Config
 	device, task string
+	extra        pilot.Extra
 }
 
-func newFakePilot() *fakePilot { return &fakePilot{status: map[string]pilot.Status{}} }
+func newFakePilot() *fakePilot {
+	mem, _ := pilot.OpenMemories("")
+	return &fakePilot{status: map[string]pilot.Status{}, mem: mem}
+}
+
+func (f *fakePilot) Memories() *pilot.Memories { return f.mem }
+
+func (f *fakePilot) Keep(device string, i int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.status[device]
+	if !ok || i < 0 || i >= len(s.Suggested) || s.Suggested[i].Decided() {
+		return pilot.ErrMemoryGone
+	}
+	sg := s.Suggested[i]
+	m, err := f.mem.Add(sg.Kind, sg.Text, sg.App)
+	if err != nil {
+		return err
+	}
+	s.Suggested = append([]pilot.Suggestion(nil), s.Suggested...)
+	s.Suggested[i].Kept = &m
+	f.status[device] = s
+	return nil
+}
+
+func (f *fakePilot) Drop(device string, i int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.status[device]
+	if !ok || i < 0 || i >= len(s.Suggested) || s.Suggested[i].Decided() {
+		return pilot.ErrMemoryGone
+	}
+	s.Suggested = append([]pilot.Suggestion(nil), s.Suggested...)
+	s.Suggested[i].Dropped = true
+	f.status[device] = s
+	return nil
+}
 
 func (f *fakePilot) Start(cfg pilot.Config, device, task string) error {
+	return f.StartWith(cfg, device, task, pilot.Extra{})
+}
+
+func (f *fakePilot) StartWith(cfg pilot.Config, device, task string, x pilot.Extra) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if strings.TrimSpace(task) == "" {
 		return pilot.ErrNoTask
 	}
-	f.started = append(f.started, fakeStart{cfg, device, task})
+	f.started = append(f.started, fakeStart{cfg, device, task, x})
 	f.status[device] = pilot.Status{Device: device, Task: task, Config: cfg, Started: time.Now(), Steps: 3,
 		Cost: 0.12, Priced: true}
 	return nil
@@ -48,7 +95,7 @@ func (f *fakePilot) Stop(device string) {
 	defer f.mu.Unlock()
 	f.stopped = append(f.stopped, device)
 	if s, ok := f.status[device]; ok && s.Running() {
-		s.Ended, s.End = time.Now(), pilot.Stopped
+		s.Ended, s.End, s.Continuable = time.Now(), pilot.Stopped, true
 		f.status[device] = s
 	}
 }
@@ -78,6 +125,55 @@ func (f *fakePilot) Dismiss(device string) {
 	if s, ok := f.status[device]; ok && !s.Running() {
 		delete(f.status, device)
 	}
+}
+
+func (f *fakePilot) Steer(device, text string) (pilot.Message, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.status[device]
+	if !ok || !s.Running() {
+		return pilot.Message{}, pilot.ErrNotRunning
+	}
+	f.seq++
+	m := pilot.Message{ID: fmt.Sprintf("m%d", f.seq), Text: strings.TrimSpace(text), At: time.Now()}
+	s.Pending = append(slices.Clone(s.Pending), m)
+	f.status[device] = s
+	return m, nil
+}
+
+func (f *fakePilot) Edit(device, id, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := f.status[device]
+	for i, m := range s.Pending {
+		if m.ID == id {
+			s.Pending = slices.Clone(s.Pending)
+			if text == "" {
+				s.Pending = slices.Delete(s.Pending, i, i+1)
+			} else {
+				s.Pending[i].Text = text
+			}
+			f.status[device] = s
+			return nil
+		}
+	}
+	return pilot.ErrRead
+}
+
+func (f *fakePilot) Withdraw(device, id string) error { return f.Edit(device, id, "") }
+
+func (f *fakePilot) Continue(device, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.status[device]
+	if !ok || !s.Continuable {
+		return pilot.ErrCannotContinue
+	}
+	f.cont = append(f.cont, text)
+	s.Ended, s.End, s.Continuable, s.Pending = time.Time{}, "", false, nil
+	s.Continues++
+	f.status[device] = s
+	return nil
 }
 
 func (f *fakePilot) stops() []string {
@@ -181,7 +277,7 @@ func TestAskPinkySetupAndKey(t *testing.T) {
 
 	// An OpenAI-compatible service needs a model too.
 	saveTestKey(t, ta, pilot.OpenAI)
-	ta.settings.PilotProvider = pilot.OpenAI
+	ta.settings.PilotService = pilot.CustomOpenAI
 	frameUntil(t, ta, tt, "Choose a model in Settings › Agents")
 }
 
@@ -226,6 +322,38 @@ func TestAskPinkyStartAndStop(t *testing.T) {
 	tt.Frame()
 	if _, ok := fp.Status(id); ok {
 		t.Errorf("Dismiss left the status")
+	}
+}
+
+// About the screen starts a question about what the phone shows: the
+// screen explained when the field is empty, else what was typed.
+func TestAskPinkyAboutTheScreen(t *testing.T) {
+	ta, fp, tt := newAskApp(t, true, true)
+	frameUntil(t, ta, tt, "About the screen")
+	if err := tt.Click("About the screen"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if len(fp.started) != 1 || !fp.started[0].extra.Screen || fp.started[0].task != "Explain what the phone shows." {
+		t.Fatalf("started %+v", fp.started)
+	}
+	fp.Stop(ta.devices[0].Info.ID)
+	fp.Dismiss(ta.devices[0].Info.ID)
+	frameUntil(t, ta, tt, "About the screen")
+	if err := tt.Click("Task for Pinky"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Type("Which order is the cheapest?")
+	tt.Frame()
+	if err := tt.Click("About the screen"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if len(fp.started) != 2 || !fp.started[1].extra.Screen || fp.started[1].task != "Which order is the cheapest?" {
+		t.Fatalf("started %+v", fp.started)
+	}
+	if ta.ask.draft != "" {
+		t.Errorf("the field kept %q", ta.ask.draft)
 	}
 }
 
@@ -281,6 +409,32 @@ func TestDescribePilot(t *testing.T) {
 	}
 }
 
+// A request the service refused never reads as a model that answered
+// without a tool, and the service's words show under it.
+func TestCheckText(t *testing.T) {
+	const said = "Function tools with reasoning effort are not supported for gpt-6.1-terra in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'."
+	for _, c := range []struct {
+		r            pilot.CheckResult
+		text, detail string
+	}{
+		{pilot.CheckResult{Problem: pilot.CheckNoTools, Detail: "Ready!"},
+			"The model answered but didn't use a tool. Pinky works through tools, so choose a model that uses them.", ""},
+		{pilot.CheckResult{Problem: pilot.CheckNoTools, Status: 400, Detail: "this model does not support tools"},
+			"The service says this model can't use tools. Pinky works through tools, so choose a model that uses them.",
+			"HTTP 400 · this model does not support tools"},
+		{pilot.CheckResult{Problem: pilot.CheckToolsAPI, Status: 400, Detail: said},
+			"The service lets this model use tools only through OpenAI's Responses API, or with its reasoning turned off, and this address has no Responses API. Choose another model, or an address that offers the Responses API.",
+			"HTTP 400 · " + said},
+	} {
+		if got := checkText(c.r); got != c.text {
+			t.Errorf("%+v: %q", c.r, got)
+		}
+		if got := checkDetail(c.r); got != c.detail {
+			t.Errorf("%+v: detail %q", c.r, got)
+		}
+	}
+}
+
 // The box's phone on All phones is the one chosen in it.
 func TestAskPinkyAllPhones(t *testing.T) {
 	ta := newTestApp(t, fakeapi.ThreePhones)
@@ -319,5 +473,229 @@ func TestAskPinkyAllPhones(t *testing.T) {
 	}
 	if len(fp.started) != 1 || fp.started[0].device != second {
 		t.Errorf("started %+v, want on %s", fp.started, second)
+	}
+}
+
+func TestAskPinkySteerAndContinue(t *testing.T) {
+	ta, fp, tt := newAskApp(t, true, true)
+	id := ta.devices[0].Info.ID
+	frameUntil(t, ta, tt, "Start")
+	if err := tt.Click("Task for Pinky"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Type("Pick a color")
+	tt.Frame()
+	if err := tt.Click("Start"); err != nil {
+		t.Fatal(err)
+	}
+	frameUntil(t, ta, tt, "Pinky is working on it")
+
+	// A message while it works waits, with Edit and Withdraw, until Pinky
+	// reads it.
+	if err := tt.Click("Message for Pinky"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Type("Use the red one")
+	tt.Frame()
+	if err := tt.Click("Send"); err != nil {
+		t.Fatal(err)
+	}
+	frameUntil(t, ta, tt, "Pinky reads this at its next step")
+	if err := tt.Click("Edit"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	ta.ask.edit = "Use the blue one"
+	tt.Frame()
+	if err := tt.Click("Save"); err != nil {
+		t.Fatal(err)
+	}
+	frameUntil(t, ta, tt, "Use the blue one")
+	if s, _ := fp.Status(id); len(s.Pending) != 1 || s.Pending[0].Text != "Use the blue one" {
+		t.Fatalf("pending: %+v", s.Pending)
+	}
+	if err := tt.Click("Withdraw"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if s, _ := fp.Status(id); len(s.Pending) != 0 {
+		t.Fatalf("pending after Withdraw: %+v", s.Pending)
+	}
+
+	// Once it stopped, Continue goes on with the same task.
+	if err := tt.Click("Stop Pinky's task"); err != nil {
+		t.Fatal(err)
+	}
+	ta.waitFor(t, "the pilot to stop", func() bool { return len(fp.stops()) == 1 })
+	frameUntil(t, ta, tt, "Next message for Pinky")
+	if err := tt.Click("Next message for Pinky"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Type("Now the green one")
+	tt.Frame()
+	if err := tt.Click("Continue"); err != nil {
+		t.Fatal(err)
+	}
+	frameUntil(t, ta, tt, "Pinky is working on it")
+	if len(fp.cont) != 1 || fp.cont[0] != "Now the green one" {
+		t.Fatalf("continued with %q", fp.cont)
+	}
+}
+
+// checkingPilot is fakePilot that checks models and counts usage, as
+// pilot.Runner does.
+type checkingPilot struct {
+	*fakePilot
+	mu      sync.Mutex
+	checked []pilot.Config
+	rows    []pilot.UsageRow
+}
+
+func (f *checkingPilot) Check(_ context.Context, cfg pilot.Config) pilot.CheckResult {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checked = append(f.checked, cfg)
+	if cfg.Model == "bad-model" {
+		return pilot.CheckResult{Problem: pilot.CheckNotFound, Status: 404, Detail: "no such model"}
+	}
+	return pilot.CheckResult{OK: true, Millis: 1200}
+}
+
+func (f *checkingPilot) Usage(since string) []pilot.UsageRow {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []pilot.UsageRow
+	for _, r := range f.rows {
+		if r.Day >= since {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (f *checkingPilot) checks() []pilot.Config {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]pilot.Config(nil), f.checked...)
+}
+
+func TestAskPinkyServices(t *testing.T) {
+	ta, fp, tt := newAskApp(t, true, false)
+	today := time.Now().Format(time.DateOnly)
+	cp := &checkingPilot{fakePilot: fp, rows: []pilot.UsageRow{
+		{Day: today, Service: "deepseek", Model: "deepseek-flash", Requests: 3, Input: 40_000, Output: 1_000, Cost: 0.0123},
+	}}
+	ta.app.opt.Pilot = cp
+	ta.settings.PilotService = "deepseek"
+	saveTestKey(t, ta, "deepseek")
+
+	// The box names the model and its service, and what it used today.
+	frameUntil(t, ta, tt, "Start")
+	frameUntil(t, ta, tt, "Today: 41,000 tokens · US$0.012")
+	if !hasText(tt, "deepseek-flash · DeepSeek") {
+		t.Errorf("no model line: %q", tt.Texts())
+	}
+
+	// Settings: the service, its suggested model, the check and usage.
+	ta.openAskSettings()
+	frameUntil(t, ta, tt, "Usage")
+	for _, want := range []string{"DeepSeek", "deepseek-flash", "https://api.deepseek.com", "Last 7 days", "3 requests · 41,000 tokens · US$0.012"} {
+		if !hasText(tt, want) {
+			t.Errorf("no %q: %q", want, tt.Texts())
+		}
+	}
+	if err := tt.Click("Check the model now"); err != nil {
+		t.Fatal(err)
+	}
+	frameUntil(t, ta, tt, "The model answered and used a tool, in 1.2 s.")
+	if c := cp.checks(); len(c) != 1 || c[0].Service != "deepseek" || c[0].KeyName() != "deepseek" {
+		t.Fatalf("checked %+v", c)
+	}
+
+	// Another model, typed: saved for the service, and checked at once.
+	ta.ask.editing, ta.ask.value = askEditModel, ""
+	tt.Frame()
+	tt.Type("bad-model")
+	tt.Key(0, mg.KeyEnter)
+	frameUntil(t, ta, tt, "The service doesn't know this model or address. Check the model's name and the API address.")
+	if !hasText(tt, "The service said: HTTP 404 · no such model") {
+		t.Errorf("no detail: %q", tt.Texts())
+	}
+	if ta.settings.PilotModels["deepseek"] != "bad-model" || ta.settings.PilotConfig().Model != "bad-model" {
+		t.Errorf("settings: %+v", ta.settings.PilotModels)
+	}
+}
+
+func TestPilotConfigOfBefore(t *testing.T) {
+	s := DefaultSettings()
+	s.PilotProvider, s.PilotOpenAIModel, s.PilotOpenAIURL = pilot.OpenAI, "glm-5", "https://open.example/v1"
+	if c := s.PilotConfig(); c.Service != pilot.CustomOpenAI || c.Model != "glm-5" || c.BaseURL != "https://open.example/v1" || c.KeyName() != pilot.OpenAI {
+		t.Fatalf("%+v", c)
+	}
+	s.PilotProvider, s.PilotAnthropicModel = pilot.Anthropic, "claude-sonnet-5-5"
+	if c := s.PilotConfig(); c.Service != pilot.Anthropic || c.Model != "claude-sonnet-5-5" || c.KeyName() != pilot.Anthropic {
+		t.Fatalf("%+v", c)
+	}
+	// A service this version does not know falls back to the API's.
+	s.PilotService = "gone"
+	if c := s.PilotConfig(); c.Service != pilot.Anthropic {
+		t.Fatalf("%+v", c)
+	}
+	s.PilotService = "kimi-cn"
+	s.setPilotModel("kimi-cn", "kimi-k3")
+	if c := s.PilotConfig(); c.Model != "kimi-k3" || c.BaseURL != "https://api.moonshot.cn/v1" || c.KeyName() != "kimi-cn" {
+		t.Fatalf("%+v", c)
+	}
+	// clone keeps the maps apart.
+	cl := s.clone()
+	s.setPilotModel("kimi-cn", "kimi-k3.1-pro")
+	if cl.PilotModels["kimi-cn"] != "kimi-k3" {
+		t.Error("clone shares PilotModels")
+	}
+}
+
+// TestAskPinkyLimitFits: the model, the limit and today's use beside the
+// box's buttons keep their lines whatever the room. In a narrow Tasks
+// panel the buttons took all of it, and "Up to 10,000,000 tokens a task"
+// was drawn a letter a line, down the side of the box; the buttons now go
+// below the lines when they do not fit beside them.
+func TestAskPinkyLimitFits(t *testing.T) {
+	for _, lang := range testLanguages() {
+		t.Run(langShort(lang), func(t *testing.T) {
+			ta, _, tt, _ := newSchedApp(t) // with Schedule…, as most have it
+			inLanguage(t, lang, tt)
+			ta.settings.PilotAnthropicModel = "a-model-pinky-has-no-prices-for"
+			ta.settings.PilotMaxCost = 10
+			limit := locales.AskTaskLimit(locales.AskTokens(10_000_000))
+			for _, w := range []int{960, 1280, 1920} {
+				tt.SetSize(w, 900)
+				frameUntil(t, ta, tt, locales.SchedButton())
+				r, ok := tt.Find(limit)
+				if !ok {
+					t.Fatalf("width %d: no %q in %q", w, limit, tt.Texts())
+				}
+				b, ok := tt.Find(locales.AskScreen())
+				if !ok {
+					t.Fatalf("width %d: no %q", w, locales.AskScreen())
+				}
+				if r.H > 2*float32(fsCaption) || r.W < 100 {
+					t.Errorf("width %d: the limit is %v, not one line", w, r)
+				}
+				if b.Y < r.Y+r.H && b.X < r.X+r.W {
+					t.Errorf("width %d: %q %v overlaps the limit %v", w, locales.AskScreen(), b, r)
+				}
+				// The buttons stay in the box: 開始 (Start) went past its
+				// right edge, to the window's, in Japanese.
+				box, ok := tt.AccessByRole(mg.RoleGroup, locales.AskTitle())
+				if !ok {
+					t.Fatalf("width %d: no box", w)
+				}
+				for _, name := range []string{locales.AskScreen(), locales.SchedButton(), locales.AskStart()} {
+					if b, ok := tt.AccessByRole(mg.RoleButton, name); !ok || b.Bounds.X+b.Bounds.W > box.Bounds.X+box.Bounds.W {
+						t.Errorf("width %d: %q %v is not inside the box %v", w, name, b.Bounds, box.Bounds)
+					}
+				}
+			}
+		})
 	}
 }

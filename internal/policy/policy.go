@@ -106,13 +106,30 @@ type Input struct {
 	Submit    bool            // OpType: press Enter afterwards
 	LongPress bool            // OpTap
 	Key       string          // OpKey
+	// Move is where a phone_swipe moves the finger, its end minus its
+	// start; zero when unknown (a pinch, a drag, a check without one).
+	Move screen.Point // OpSwipe
 	// TaskApps is the task's app allow-list (ids or names); empty means none.
 	TaskApps []string
-	// ScopeApps limits the agent to these apps (ids or names); empty means
-	// every app.
+	// ScopeApps limits the agent to these apps (ids or names). An empty
+	// list limits nothing unless Scoped is set.
 	ScopeApps []string
-	// ReadOnly forces read-only mode, for agents whose scope is read-only.
+	// Scoped says the agent may use only the apps in ScopeApps, also when
+	// the list is empty: an agent limited to the apps the person chooses,
+	// with none chosen, can use no app.
+	Scoped bool
+	// ReadOnly forces read-only mode for the agent's session: the agent's
+	// access is read-only (ReadOnlyAccess), or it asked to run the task
+	// read-only. Read-only mode in Settings › Safety applies without it.
 	ReadOnly bool
+	// ReadOnlyAccess is set with ReadOnly when the person gave the agent
+	// read-only access (its scope, chosen on its first-connection card
+	// and changed in Settings › Agents), so refusals say where it comes
+	// from. Without it, ReadOnly comes from the agent's own request.
+	ReadOnlyAccess bool
+	// Virtual is set for a virtual phone, an emulator or a Simulator on this
+	// computer (File.VirtualCredentials).
+	Virtual bool
 	// AllowBlocked is set when the person allowed the app for the task
 	// although a rule blocks it (a finance app, or one they blocked): rules
 	// that block whole apps do not apply to it. Every other rule still

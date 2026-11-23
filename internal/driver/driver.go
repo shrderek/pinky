@@ -632,6 +632,13 @@ const (
 	HelperBuilding   HelperStep = "building"   // Xcode builds and signs it: a minute or two
 	HelperInstalling HelperStep = "installing" // installing it and starting it once; the phone may ask for its passcode
 	HelperUnlock     HelperStep = "unlock"     // Xcode waits for the phone to be unlocked
+	// HelperLite is news rather than a step: the app Pinky installs is its
+	// lite build, without a VPN of its own (the team cannot sign one, as a
+	// free Apple ID's cannot), which needs LocalDevVPN from the App Store to
+	// run tasks on the phone itself. It comes once Xcode has built that
+	// app, and the steps go on; clients tell the person once the install
+	// is done, and keep showing the step before it meanwhile.
+	HelperLite HelperStep = "lite"
 )
 
 // HelperTeam is a developer team the computer can sign the helper for.
@@ -1053,7 +1060,7 @@ func (e *packageError) Is(target error) bool { return target == ErrPackage }
 // WorkWatcher is told whether an agent works on the phone: from the start
 // of a task to its end, except while the person is in control. A driver
 // keeps on, only while one does, what agents need and the phone's apps can
-// see: Pinky for Android, whose accessibility service banking apps
+// see: Pinky on the phone, whose accessibility service banking apps
 // refuse to sign in next to. The gateway calls AgentWorking right after it
 // opens the device and whenever the answer changes; it must return at once
 // and do any work in the background.
@@ -1205,7 +1212,38 @@ type Away struct {
 	Missing string
 	// Detail says the same in a sentence.
 	Detail string
+	// Manual reports whether the person entered the phone's tailnet
+	// address by hand (TailnetByHand): the provider then reaches it
+	// without reading Tailscale on this computer.
+	Manual bool
 }
+
+// TailnetByHand is a Tailnet provider that also reaches a phone at a
+// tailnet address the person enters, for a computer that reaches the
+// tailnet some other way than Tailscale's own app (a proxy with a
+// Tailscale outbound, say), so that the provider cannot read Tailscale's
+// status here. The provider cannot see how this computer routes the
+// traffic either: the connection is only as private as that route.
+type TailnetByHand interface {
+	// SetAwayAt sets a phone up as SetAway does, at addr, the phone's
+	// tailnet address. The phone must be connected by cable or Wi-Fi.
+	// The address must be in Tailscale's ranges (else ErrNotTailnetAddr)
+	// and the phone's own on its VPN (else ErrAddrNotOnPhone): on its VPN
+	// interface, or on none of its interfaces while a VPN that runs
+	// Tailscale in userspace is up; this
+	// computer must reach the phone there (else ErrAddrUnreachable, or
+	// ErrNotListening when something answers but not the phone's adb);
+	// and what answers there must be this phone (else ErrNotThePhone).
+	SetAwayAt(ctx context.Context, id, addr string) (Away, error)
+}
+
+// Errors of TailnetByHand.SetAwayAt.
+var (
+	ErrNotTailnetAddr  = errors.New("not a tailnet address: it must be in 100.64.0.0/10 or fd7a:115c:a1e0::/48")
+	ErrAddrNotOnPhone  = errors.New("the address is not the phone's own on its VPN")
+	ErrAddrUnreachable = errors.New("this computer does not reach the phone at that address")
+	ErrNotThePhone     = errors.New("the device that answers at that address is not this phone")
+)
 
 // What keeps a phone from being set up to be reached away from home, in
 // Away.Missing.
@@ -1488,7 +1526,7 @@ var (
 	// it until that one is done (BusyError says who).
 	ErrBusy = errors.New("another agent is using the phone")
 	// ErrStoppedOnPhone: the person stopped the agent's task on the phone
-	// itself (Stop on Pinky for Android's pill), and the task must end. A
+	// itself (Stop on Pinky on the phone's pill), and the task must end. A
 	// driver returns it from Observe and the actions until the agent stops
 	// working (WorkWatcher).
 	ErrStoppedOnPhone = errors.New("the person stopped this task on the phone")
@@ -1574,7 +1612,7 @@ const (
 	CheckADB          = "adb"           // Android: the adb server answers
 	CheckConnection   = "connection"    // the phone is connected and answers
 	CheckAuthorized   = "authorized"    // the phone allows this computer (USB debugging allowed, trusted)
-	CheckCompanion    = "companion"     // Android: Pinky for Android is installed, current and on
+	CheckCompanion    = "companion"     // Android: Pinky on the phone is installed, current and on
 	CheckInput        = "input"         // taps, swipes and keys reach the phone
 	CheckScreen       = "screen"        // screenshots and the live picture
 	CheckBackground   = "background"    // agents can work on a background display
@@ -1588,7 +1626,7 @@ const (
 	FixAuthorize        = "authorize"          // allow this computer on the phone (Allow USB debugging, Trust)
 	FixUSBPermission    = "usb_permission"     // Linux: the computer may not open the phone's USB device (udev rules)
 	FixUSBDriver        = "usb_driver"         // Windows: the phone's USB debugging has no driver
-	FixInstallCompanion = "install_companion"  // install Pinky for Android
+	FixInstallCompanion = "install_companion"  // install Pinky on the phone
 	FixUpdateCompanion  = "update_companion"   // update it to the version Pinky carries
 	FixTurnOnCompanion  = "turn_on_companion"  // turn its accessibility service on
 	FixInputPermission  = "input_permission"   // the phone refuses input from the computer (Xiaomi's USB debugging (Security settings), ColorOS's permission monitoring)
@@ -1603,7 +1641,7 @@ const (
 	FixSameNetwork      = "same_network"       // put the phone on the same Wi-Fi as this computer, one that lets devices reach each other
 	FixWiFiSetting      = "wifi_setting"       // turn on Use iPhones and iPads over Wi-Fi in Settings › Phones
 
-	// FixTurnOnCompanionByHand: turn Pinky for Android's accessibility
+	// FixTurnOnCompanionByHand: turn Pinky on the phone's accessibility
 	// service on in the phone's accessibility settings, by hand: the phone
 	// does not let Pinky do it over USB debugging (CompanionManual).
 	FixTurnOnCompanionByHand = "turn_on_companion_by_hand"

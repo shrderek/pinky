@@ -60,6 +60,9 @@ type netPhone struct {
 	// used away from home (SetAway); "" when it is not.
 	Node    string `json:"node,omitempty"`
 	Tailnet string `json:"tailnet,omitempty"`
+	// Manual reports that the person entered the Tailnet address by hand
+	// (SetAwayAt): Pinky reaches it without reading Tailscale here.
+	Manual bool `json:"manual,omitempty"`
 }
 
 func (n netPhone) port() int {
@@ -220,6 +223,23 @@ func (s *netStore) pairedAddr(guid string) string {
 	for _, a := range s.paired {
 		if a.GUID == guid {
 			return a.Addr
+		}
+	}
+	return ""
+}
+
+// pairedGUID returns the guid of the paired phone that was last connected
+// at an address, "" when none was.
+func (s *netStore) pairedGUID(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadLocked()
+	for _, a := range s.paired {
+		if a.Addr == addr {
+			return a.GUID
 		}
 	}
 	return ""
@@ -454,9 +474,17 @@ func (p *Provider) connectWhenUp(ctx context.Context, serial string) error {
 // a while: the person may be away from it.
 func (p *Provider) waitConnected(ctx context.Context, serial string, trust bool) (driver.Info, error) {
 	var asking time.Time
+	gone := func() (driver.Info, error) {
+		return driver.Info{}, fmt.Errorf("android: adb connected to %s, but the phone did not come online: %w", serial, driver.ErrOffline)
+	}
 	for {
 		entries, err := p.cfg.Client.Devices(ctx)
 		if err != nil {
+			if timeUp(ctx, err) {
+				// The time ran out during the listing rather than
+				// between two: the phone did not come online all the same.
+				return gone()
+			}
 			return driver.Info{}, wrapErr(err)
 		}
 		for _, e := range entries {
@@ -480,9 +508,21 @@ func (p *Provider) waitConnected(ctx context.Context, serial string, trust bool)
 			}
 		}
 		if err := sleepCtx(ctx, pairPoll); err != nil {
-			return driver.Info{}, fmt.Errorf("android: adb connected to %s, but the phone did not come online: %w", serial, driver.ErrOffline)
+			return gone()
 		}
 	}
+}
+
+// timeUp reports whether err comes from ctx's time running out. A dial
+// bound by ctx's deadline can time out an instant before ctx says it is
+// done ("i/o timeout" while ctx.Err() is still nil), which made
+// TestSetAwayAtNoADB fail now and then on a busy computer.
+func timeUp(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	dl, ok := ctx.Deadline()
+	return ok && !time.Now().Before(dl)
 }
 
 // connectErr words a failed connection at an address: refused means the
@@ -686,6 +726,14 @@ func (t *netLink) reconnect(ctx context.Context, phones []netPhone, entries []ad
 		if n.Tailnet == "" || serialInUse(entries, n.tailSerial()) {
 			continue
 		}
+		if n.Manual {
+			// Entered by hand: Tailscale here may be missing, so a probe
+			// says whether the phone is there.
+			if !t.byHand(ctx, n) {
+				missing = true
+			}
+			continue
+		}
 		if st == nil {
 			s, err := p.tailnetStatus(ctx)
 			if err != nil {
@@ -886,6 +934,9 @@ func (t *netLink) refused(n netPhone) bool {
 func (t *netLink) why(n netPhone) (setup, detail string) {
 	if t.refused(n) {
 		return driver.SetupNetworkOff, "Its adb stopped listening on the network, as it does when the phone restarts: plug it in once and turn its Wi-Fi connection on again"
+	}
+	if n.LAN == "" && n.Manual {
+		return driver.SetupNetworkAway, "Not reachable at the tailnet address entered by hand now; Pinky tries again by itself"
 	}
 	if n.LAN == "" {
 		return driver.SetupNetworkAway, "Not reachable through Tailscale now; Pinky connects again by itself once Tailscale says the phone is online"

@@ -21,9 +21,11 @@ type netProvider struct {
 	mu          sync.Mutex
 	conn        map[string]string // Info.Connection by id; the demo's is "usb"
 	unplugged   map[string]bool   // not listed
+	listErr     error            // List fails with it
 	forgotten   map[string]bool
 	calls       []string                 // "forget id", "remember id", "disconnect id"
 	gate        map[string]chan struct{} // Open of these phones waits for the channel to close
+	atGate      int                      // Opens that reached a gate
 	openedClose []*closeCounter          // the gated phones' sessions
 }
 
@@ -36,6 +38,9 @@ func (p *netProvider) List(ctx context.Context) ([]driver.Info, error) {
 	infos, err := p.Provider.List(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.listErr != nil {
+		return nil, p.listErr
+	}
 	var out []driver.Info
 	for _, info := range infos {
 		if p.unplugged[info.ID] {
@@ -67,6 +72,9 @@ func (p *netProvider) Open(ctx context.Context, id string) (driver.Device, error
 	dev, err := p.Provider.Open(ctx, id)
 	p.mu.Lock()
 	gate := p.gate[id]
+	if gate != nil && err == nil {
+		p.atGate++
+	}
 	p.mu.Unlock()
 	if gate == nil || err != nil {
 		return dev, err
@@ -334,8 +342,13 @@ func TestRemoveDeviceAddBack(t *testing.T) {
 	}
 }
 
-// TestRemoveDeviceOnACable: a phone on a cable comes back at the next
-// discovery, as a new phone; once it does, it is no longer removed.
+// TestRemoveDeviceOnACable: a phone removed while it is on its cable
+// stays off the list while it keeps being listed there, across discovery
+// passes and a restart - staying plugged in, as an iPhone charging from
+// the computer does, is not the person adding it back. It comes back
+// once it leaves and returns, as a new phone; once it does, it is no
+// longer removed. A phone removed while away from its cable still comes
+// back the next time it is plugged in.
 func TestRemoveDeviceOnACable(t *testing.T) {
 	dir := t.TempDir()
 	p, _, _ := newTwoPhones()
@@ -348,6 +361,20 @@ func TestRemoveDeviceOnACable(t *testing.T) {
 	if err := g.RemoveDevice(ctx, "pixel", RemoveOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	// Removed on its cable, and still on it: it stays off the list.
+	time.Sleep(200 * time.Millisecond)
+	if got := ids(g); !slices.Equal(got, []string{"mi"}) {
+		t.Fatalf("a phone removed on its cable came back while still plugged in: %q", got)
+	}
+	if got := p.callLog(); !slices.Equal(got, []string{"forget pixel", "disconnect pixel"}) {
+		t.Errorf("the provider heard %q", got)
+	}
+
+	// It leaves and returns: the return is the person's doing, and it is
+	// back at once, as a new phone.
+	p.set(func(p *netProvider) { p.unplugged["pixel"] = true })
+	time.Sleep(200 * time.Millisecond)
+	p.set(func(p *netProvider) { delete(p.unplugged, "pixel") })
 	waitIDs(t, g, "mi", "pixel")
 	waitOpen(t, g, "pixel")
 	if g.Background("pixel") {
@@ -360,7 +387,10 @@ func TestRemoveDeviceOnACable(t *testing.T) {
 		t.Errorf("the provider heard %q", got)
 	}
 
-	// Unplugged when removed, then plugged in again.
+	// Unplugged when removed, then plugged in again: that still brings
+	// it back, even across a restart - but only once it has left and
+	// returned, since the away mark is in memory: still plugged in when
+	// Pinky starts, it stays away first.
 	p.set(func(p *netProvider) { p.unplugged["pixel"] = true })
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -376,10 +406,25 @@ func TestRemoveDeviceOnACable(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitIDs(t, g, "mi")
+	p.set(func(p *netProvider) { delete(p.unplugged, "pixel") })
+	waitIDs(t, g, "mi", "pixel") // away at removal: the next plug-in adds it back
+
+	// Removed, and still plugged in while Pinky restarts: it stays away
+	// until it leaves and returns.
+	if err := g.RemoveDevice(ctx, "pixel", RemoveOptions{}); err != nil {
+		t.Fatal(err)
+	}
 	g.Close()
 	p2, _, _ := newTwoPhones()
 	g = twoPhones(t, dir, p2)
-	waitIDs(t, g, "mi", "pixel") // plugged in while Pinky was closed
+	time.Sleep(200 * time.Millisecond)
+	if got := ids(g); !slices.Equal(got, []string{"mi"}) {
+		t.Fatalf("a removed phone still plugged in came back at a restart: %q", got)
+	}
+	p2.set(func(p *netProvider) { p.unplugged["pixel"] = true })
+	time.Sleep(200 * time.Millisecond)
+	p2.set(func(p *netProvider) { delete(p.unplugged, "pixel") })
+	waitIDs(t, g, "mi", "pixel")
 	g.Close()
 	p3, _, _ := newTwoPhones()
 	g = twoPhones(t, dir, p3)
@@ -387,6 +432,91 @@ func TestRemoveDeviceOnACable(t *testing.T) {
 	if got := p3.callLog(); len(got) != 0 {
 		t.Errorf("a phone plugged in again was forgotten at the next start: %q", got)
 	}
+}
+
+// TestRemoveDeviceOnACableListFailure: a discovery pass in which the
+// provider's List fails must not count the phones it could not list as
+// away from their cables: one hiccup does not add a phone removed on
+// its cable back.
+func TestRemoveDeviceOnACableListFailure(t *testing.T) {
+	dir := t.TempDir()
+	p, _, _ := newTwoPhones()
+	g := twoPhones(t, dir, p)
+	ctx := context.Background()
+	waitOpen(t, g, "pixel")
+
+	if err := g.RemoveDevice(ctx, "pixel", RemoveOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := ids(g); !slices.Equal(got, []string{"mi"}) {
+		t.Fatalf("devices after removing the Pixel: %q", got)
+	}
+
+	// A pass whose listing fails, then normal passes: the Pixel stays
+	// away while it stays on its cable.
+	p.set(func(p *netProvider) { p.listErr = errors.New("the phone hiccuped") })
+	time.Sleep(200 * time.Millisecond)
+	p.set(func(p *netProvider) { p.listErr = nil })
+	time.Sleep(300 * time.Millisecond)
+	if got := ids(g); !slices.Equal(got, []string{"mi"}) {
+		t.Fatalf("a phone removed on its cable came back after a failed listing: %q", got)
+	}
+
+	// It still comes back once it leaves and returns.
+	p.set(func(p *netProvider) { p.unplugged["pixel"] = true })
+	time.Sleep(200 * time.Millisecond)
+	p.set(func(p *netProvider) { delete(p.unplugged, "pixel") })
+	waitIDs(t, g, "mi", "pixel")
+}
+
+// TestRemoveDeviceOnWiFiThenCabled: a phone removed over Wi-Fi that shows
+// up on a cable comes back at once - plugging in a phone that was not on
+// its cable when removed is the person's doing.
+func TestRemoveDeviceOnWiFiThenCabled(t *testing.T) {
+	dir := t.TempDir()
+	p, _, _ := newTwoPhones()
+	g := twoPhones(t, dir, p)
+	ctx := context.Background()
+	waitOpen(t, g, "mi")
+
+	if err := g.RemoveDevice(ctx, "mi", RemoveOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := ids(g); !slices.Equal(got, []string{"pixel"}) {
+		t.Fatalf("devices after removing the Mi: %q", got)
+	}
+
+	// Plugged in: it is back.
+	p.set(func(p *netProvider) { p.conn["mi"] = "usb" })
+	waitIDs(t, g, "mi", "pixel")
+	waitOpen(t, g, "mi")
+}
+
+// TestRemoveDeviceOnACablePairAgain: a phone removed on its cable still
+// comes back when the person pairs it again, without leaving the cable.
+// The fake provider pairs the Mi, so it is the Mi that goes on the cable
+// first.
+func TestRemoveDeviceOnACablePairAgain(t *testing.T) {
+	dir := t.TempDir()
+	p, _, _ := newTwoPhones()
+	p.set(func(p *netProvider) { p.conn["mi"] = "usb" })
+	g := twoPhones(t, dir, p)
+	ctx := context.Background()
+	waitOpen(t, g, "mi")
+
+	if err := g.RemoveDevice(ctx, "mi", RemoveOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := ids(g); !slices.Equal(got, []string{"pixel"}) {
+		t.Fatalf("devices after removing the Mi: %q", got)
+	}
+	if _, err := g.PairWithCode(ctx, "192.168.1.42:37123", "123456"); err != nil {
+		t.Fatal(err)
+	}
+	waitIDs(t, g, "mi", "pixel")
 }
 
 // TestRemoveDeviceHistory: with History, the phone's tasks go from
@@ -434,7 +564,20 @@ func TestRemoveDeviceWhileOpening(t *testing.T) {
 		p.gate["mi"] = gate
 		delete(p.unplugged, "mi")
 	})
-	waitIDs(t, g, "mi", "pixel") // listed, and being opened
+	waitIDs(t, g, "mi", "pixel") // listed
+	// Listed comes a moment before the gateway decides to open it: removed
+	// in between, it is never opened, rightly, and there is nothing to test.
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		p.mu.Lock()
+		n := p.atGate
+		p.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d opens of the Mi at the gate, want 1", n)
+		}
+	}
 	if err := g.RemoveDevice(context.Background(), "mi", RemoveOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -491,8 +634,21 @@ func TestRemoveDeviceForgetsConnection(t *testing.T) {
 	if err != nil || len(ways) != 0 {
 		t.Errorf("stored connections %v, %v", ways, err)
 	}
-	// A demo phone counts as plugged in: it comes back once, opened the
-	// driver's own way, and not before removal finished.
+	// A demo phone counts as plugged in, and it was plugged in when
+	// removed: it stays off the list while it keeps being listed.
+	time.Sleep(200 * time.Millisecond)
+	if _, now := cp.state(); now != opens {
+		t.Errorf("opened %d times while removed on its cable, want 0", now-opens)
+	}
+	// Once it leaves and returns, it comes back once, opened the
+	// driver's own way.
+	cp.mu.Lock()
+	cp.unplugged = true
+	cp.mu.Unlock()
+	time.Sleep(200 * time.Millisecond)
+	cp.mu.Lock()
+	cp.unplugged = false
+	cp.mu.Unlock()
 	waitOpen(t, g, "pixel")
 	if _, now := cp.state(); now != opens+1 {
 		t.Errorf("opened %d times after the removal, want 1", now-opens)

@@ -172,7 +172,7 @@ func (a *app) foundButtons(c *mg.Context, d gateway.DeviceView, small bool) {
 func (a *app) foundPage(c *mg.Context, d gateway.DeviceView) {
 	p := pal(c)
 	mg.Column(c).AlignItems(mg.Center).Gap(10).MaxWidth(440).Role(mg.RoleStatus).Children(func() {
-		mg.Icon(c, icWifi).FontSize(28).TextColor(p.accentInk)
+		mg.Icon(c, icWifi).FontSize(iconHero).TextColor(p.accentInk)
 		mg.Text(c, locales.FoundTitle(d.Info.Name)).FontSize(fsTitle3).FontWeight(fwSemibold).TextAlign(mg.Center)
 		if line := foundLine(d); line != "" {
 			mg.Text(c, line).FontSize(fsSmall).TextColor(p.ink3)
@@ -235,7 +235,7 @@ func (a *app) foundBox(c *mg.Context) {
 	p := pal(c)
 	mg.Column(c).Padding(14, 16).Radius(12).Background(p.bg2).Gap(10).Label(locales.AddPhoneIPhoneFoundTitle()).Children(func() {
 		mg.Row(c).Gap(8).AlignItems(mg.Center).Children(func() {
-			mg.Icon(c, icWifi).FontSize(16).TextColor(p.accentInk)
+			mg.Icon(c, icWifi).FontSize(iconBody).TextColor(p.accentInk)
 			mg.Text(c, locales.AddPhoneIPhoneFoundTitle()).FontSize(fsHeadline).FontWeight(fwSemibold)
 		})
 		guideText(c, locales.AddPhoneIPhoneFoundDetail())
@@ -263,7 +263,7 @@ func (a *app) changedPage(c *mg.Context, d gateway.DeviceView) {
 	busy := a.foundBusy(d.Info.ID)
 	_, can := a.api.(phoneTruster)
 	mg.Column(c).AlignItems(mg.Center).Gap(10).MaxWidth(440).Role(mg.RoleStatus).Children(func() {
-		mg.Icon(c, icAlert).FontSize(28).TextColor(p.amberDot)
+		mg.Icon(c, icAlert).FontSize(iconHero).TextColor(p.amberDot)
 		mg.Text(c, locales.ChangedTitle(d.Info.Name)).FontSize(fsTitle3).FontWeight(fwSemibold).TextAlign(mg.Center)
 		mg.Text(c, locales.ChangedDetail(d.Info.Name)).FontSize(fsSmall).TextColor(p.ink2).TextAlign(mg.Center)
 		mg.Box(c).Height(4)
@@ -329,14 +329,16 @@ func (a *app) trustPhone(d gateway.DeviceView) {
 // Wi-Fi (gateway.DeviceConnecting).
 func (a *app) connectingPage(c *mg.Context, d gateway.DeviceView) {
 	p := pal(c)
-	title := locales.PhoneConnectingTitle(d.Info.Name)
+	title, sub := locales.PhoneConnectingTitle(d.Info.Name), locales.PhoneConnectingTask()
 	switch d.StatusLine {
 	case "Moving to Wi-Fi":
 		title = locales.PhoneMovingWiFiTitle(d.Info.Name)
 	case "Moving to the cable":
 		title = locales.PhoneMovingCableTitle(d.Info.Name)
-	case "Switching to Pinky for iPhone", "Switching to the helper":
+	case "Switching to Pinky on the iPhone", "Switching to Pinky for iPhone", "Switching to the helper":
 		title = locales.PhoneSwitchHelperTitle(d.Info.Name)
+		// The agent on the computer goes on: only the connection changes.
+		sub = locales.PhoneSwitchHelperTask()
 	case "Switching to CoreDevice":
 		title = locales.PhoneSwitchCoreDeviceTitle(d.Info.Name)
 	}
@@ -346,7 +348,7 @@ func (a *app) connectingPage(c *mg.Context, d gateway.DeviceView) {
 		})
 		mg.Text(c, title).FontSize(fsTitle3).FontWeight(fwSemibold).TextAlign(mg.Center)
 		if d.TaskID != "" {
-			mg.Text(c, locales.PhoneConnectingTask()).FontSize(fsSmall).TextColor(p.ink2).TextAlign(mg.Center)
+			mg.Text(c, sub).FontSize(fsSmall).TextColor(p.ink2).TextAlign(mg.Center)
 		}
 	})
 }
@@ -362,7 +364,7 @@ func lostOnWiFi(d gateway.DeviceView) bool {
 func (a *app) lostPage(c *mg.Context, d gateway.DeviceView) {
 	p := pal(c)
 	mg.Column(c).AlignItems(mg.Center).Gap(10).MaxWidth(440).Role(mg.RoleStatus).Children(func() {
-		mg.Icon(c, icWifiOff).FontSize(28).TextColor(p.amberDot)
+		mg.Icon(c, icWifiOff).FontSize(iconHero).TextColor(p.amberDot)
 		mg.Text(c, locales.LostTitle(d.Info.Name)).FontSize(fsTitle3).FontWeight(fwSemibold).TextAlign(mg.Center)
 		mg.Text(c, locales.LostDetail(d.Info.Name)).FontSize(fsSmall).TextColor(p.ink2).TextAlign(mg.Center)
 		mg.Box(c).Height(4)
@@ -380,20 +382,30 @@ func (a *app) restartControls(c *mg.Context, d gateway.DeviceView, center bool) 
 			t.TextAlign(mg.Center)
 		}
 	}
-	if _, ok := a.api.(deviceServiceRestarter); ok && guideOS == "darwin" {
-		mg.Row(c).Gap(8).AlignItems(mg.Center).Children(func() {
-			b := button(c.Key("restart-"+d.Info.ID), locales.LostRestart(), btnOpt{kind: btnPrimary}).Disabled(a.found.restarting)
-			if b.Clicked() {
-				a.found.asking, a.found.askFor = true, d.Info.ID
-			}
-			if a.found.restarting {
-				spinner(c)
-			}
-		})
+	if a.restartButton(c, d) {
 		note(locales.LostRestartNote())
 	}
 	note(locales.LostManual())
 	a.restartDialog(c, d)
+}
+
+// restartButton is the restart button, which asks first (restartDialog),
+// where the gateway can restart the device service; it reports whether it
+// showed.
+func (a *app) restartButton(c *mg.Context, d gateway.DeviceView) bool {
+	if _, ok := a.api.(deviceServiceRestarter); !ok || guideOS != "darwin" {
+		return false
+	}
+	mg.Row(c).Gap(8).AlignItems(mg.Center).Children(func() {
+		b := button(c.Key("restart-"+d.Info.ID), locales.LostRestart(), btnOpt{kind: btnPrimary}).Disabled(a.found.restarting)
+		if b.Clicked() {
+			a.found.asking, a.found.askFor = true, d.Info.ID
+		}
+		if a.found.restarting {
+			spinner(c)
+		}
+	})
+	return true
 }
 
 // restartDialog asks before restarting the device service for a phone.

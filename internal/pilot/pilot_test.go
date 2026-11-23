@@ -725,7 +725,7 @@ func TestStartErrors(t *testing.T) {
 	if err := r.Start(Config{}, "pixel", "  "); err != ErrNoTask {
 		t.Fatalf("no task: %v", err)
 	}
-	if err := r.Start(Config{Provider: OpenAI}, "pixel", "Do it"); err != ErrNoModel {
+	if err := r.Start(Config{Service: CustomOpenAI}, "pixel", "Do it"); err != ErrNoModel {
 		t.Fatalf("no model: %v", err)
 	}
 	r.Close()
@@ -858,6 +858,70 @@ func TestOpenAI(t *testing.T) {
 		t.Fatalf("messages: %v", msgs)
 	}
 }
+
+func TestOpenCodeSession(t *testing.T) {
+	// OpenCode Go refuses a request without x-opencode-session, which must
+	// stay the same through a task's conversation; other services get none.
+	var got []string
+	hc := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+		got = append(got, r.Header.Get("x-opencode-session"))
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Request: r,
+			Body: io.NopCloser(strings.NewReader(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))}, nil
+	})}
+	o := newOpenAI(Config{Provider: OpenAI, Model: "glm-5.3", BaseURL: "https://opencode.ai/inference/go/openai/v1"}, "k", hc, "sys", nil)
+	for range 2 {
+		if _, err := o.send(context.Background(), nil, "hi"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(got) != 2 || got[0] == "" || got[0] != got[1] {
+		t.Fatalf("sessions %q", got)
+	}
+	if o2 := newOpenAI(Config{Provider: OpenAI, Model: "glm-5.3", BaseURL: "https://opencode.ai/inference/go/openai/v1"}, "k", hc, "sys", nil); o2.session == o.session {
+		t.Fatal("two tasks share a session")
+	}
+	got = nil
+	o = newOpenAI(Config{Provider: OpenAI, Model: "m", BaseURL: "https://api.example.com/v1"}, "k", hc, "sys", nil)
+	if _, err := o.send(context.Background(), nil, "hi"); err != nil || len(got) != 1 || got[0] != "" {
+		t.Fatalf("err %v, sessions %q", err, got)
+	}
+}
+
+func TestOpenAIExtraContent(t *testing.T) {
+	// Gemini's OpenAI-compatible API signs each tool call and refuses the
+	// next request when the call comes back without its signature (#105).
+	const extra = `{"google":{"thought_signature":"c2ln"}}`
+	var posts []string
+	hc := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+		data, _ := io.ReadAll(r.Body)
+		posts = append(posts, string(data))
+		body := `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`
+		if len(posts) == 1 {
+			body = `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function",` +
+				`"function":{"name":"phone_apps","arguments":"{}"},"extra_content":` + extra + `}]},"finish_reason":"tool_calls"}]}`
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Request: r,
+			Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	o := newOpenAI(Config{Provider: OpenAI, Model: "gemini", BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai"}, "k", hc, "sys", nil)
+	tn, err := o.send(context.Background(), nil, "open the apps")
+	if err != nil || len(tn.calls) != 1 {
+		t.Fatalf("first turn: %+v, %v", tn, err)
+	}
+	if _, err := o.send(context.Background(), []result{{id: "c1", text: "apps"}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(posts) != 2 || !strings.Contains(posts[1], `"extra_content":`+extra) {
+		t.Fatalf("the second request lost the signature: %s", posts[len(posts)-1])
+	}
+	if strings.Contains(posts[0], "extra_content") {
+		t.Fatalf("extra_content where no service sent one: %s", posts[0])
+	}
+}
+
+type roundTrip func(*http.Request) (*http.Response, error)
+
+func (f roundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestOpenAIImages(t *testing.T) {
 	// A model that takes no images: the request goes again without them,

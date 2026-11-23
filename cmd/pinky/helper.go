@@ -25,13 +25,20 @@ const helperUsage = "usage: pinky helper install [--team ID] [--bundle-id ID] [-
 // (appinstall.go), unless --helper-only.
 // Run again to sign it anew once its signature runs out.
 func runHelper(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "help", "-h", "-help", "--help":
+			fmt.Fprintln(os.Stdout, helperUsage)
+			return nil
+		}
+	}
 	if len(args) == 0 || args[0] != "install" {
 		return errors.New(helperUsage)
 	}
 	fs := flag.NewFlagSet("pinky helper install", flag.ContinueOnError)
 	team := fs.String("team", "", "Apple developer `team ID` to sign with (default: the team of Pinky Helper on the phone, or the only one on this Mac)")
 	bundleID := fs.String("bundle-id", "", "Pinky Helper's `bundle id` (default: the one on the phone)")
-	helperOnly := fs.Bool("helper-only", false, "install the older Pinky Helper, not Pinky for iPhone, to host WebDriverAgent")
+	helperOnly := fs.Bool("helper-only", false, "install the older Pinky Helper, not Pinky on the iPhone, to host WebDriverAgent")
 	local := fs.Bool("local-signing", false, "sign only with the profiles on this Mac; never let Xcode register the phone or make a profile")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err

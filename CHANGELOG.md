@@ -2,6 +2,396 @@
 
 What changed for people in each release of Pinky, newest first. A version is the release's date in Asia/Shanghai and that day's count: 2026.1107.2 is the second release of 7 November 2026. Notes wait under "Unreleased" until the next release takes them; see [docs/RELEASING.md](docs/RELEASING.md).
 
+## 2026.1123.6 (2026-11-23)
+
+- Reading on with the continuation of a long list on a web page no longer stops right away saying content may have been skipped, when the screen showed many lines. Thanks @pseudoyu.
+
+## 2026.1123.5 (2026-11-23)
+
+- On Android, Pinky can now be your phone's digital assistant app (Settings › Apps › Default apps), so holding the power button or using the assistant gesture asks Pinky about what's on the screen. Thanks @Aoufgo for suggesting it.
+- Asking about the screen from the floating button no longer sometimes reads Pinky's own panel instead of the app behind it.
+
+## 2026.1123.4 (2026-11-23)
+
+- Reading a long list on a web page with bullets no longer returns some rows twice or stops partway saying content may have been skipped. Thanks @pseudoyu.
+- Reading a long list on a web page no longer ends saying content may have been skipped when it reached the bottom, and reading back up no longer repeats rows. Thanks @pseudoyu.
+
+## 2026.1123.3 (2026-11-23)
+
+- On Android, when the app an agent works in on the background display closes (Back from its first screen, or a crash), the task now stays on that display instead of moving to the phone's own screen. Thanks @pseudoyu.
+
+## 2026.1123.2 (2026-11-23)
+
+- `pinky devices --json` now prints an empty list (`[]`) instead of `null` when there are no phones, whether or not Pinky is running. Thanks @6moran.
+
+## 2026.1123.1 (2026-11-23)
+
+- With a free Apple ID, Pinky on the iPhone now waits for LocalDevVPN in its setup: it links to it in the App Store, shows the Tunnel IP and Device IP to enter, and tells you when LocalDevVPN is off or set to the wrong address. Thanks pepper on Discord for reporting it.
+- After Install Pinky on the iPhone installs the lighter app for a free Apple ID, Pinky shows how to set up LocalDevVPN on the phone.
+
+## 2026.1122.9 (2026-11-22)
+
+- On an iPhone connected through Pinky on the iPhone, a screen whose elements take the phone too long to give (such as a long list in some apps) no longer makes every call fail: Pinky reads its text from a picture instead, and reads that app faster for the next few minutes.
+- Taps and swipes on such a screen now say they reached the phone instead of ending as uncertain.
+- Opening an app that needs Pinky on the iPhone no longer makes the agent's call time out while the phone moves there.
+
+## 2026.1122.8 (2026-11-22)
+
+- Agents can now read a list on web pages that show no list, such as a bank's statement page on iPhone: Pinky scrolls the page's content and says which part it read.
+- On a phone that reads its screen slowly, reading a list now ends with what it read so far and a way to continue, instead of an error, and each continuation gets further down the list.
+- Continuing a list read no longer repeats lines that were already read.
+
+## 2026.1122.7 (2026-11-22)
+
+- When an agent's task waits for an iPhone the Mac lost on Wi-Fi, Pinky now shows it in Needs you with Restart device service and sends a notification, so someone nearby can bring the phone back.
+- Agents are told that only someone at the computer can bring back an iPhone the Mac lost on Wi-Fi, so a scheduled run nobody watches stops or uses another phone instead of waiting 15 minutes.
+
+## 2026.1122.6 (2026-11-22)
+
+- Files whose names start or end with a space now copy to and from Android phones as they are, instead of stopping the copy or replacing another file. Thanks @pseudoyu.
+- Typing a tailnet address for an Android phone that doesn't answer there now says the address can't be reached, instead of sometimes showing a timeout from Pinky's own adb connection.
+
+## 2026.1122.5 (2026-11-22)
+
+- With the Assistant open on an Android phone, Pinky no longer tells the agent that an app with a blank name came to the front, and no longer refuses its next action for it. Thanks @pseudoyu.
+
+## 2026.1122.4 (2026-11-22)
+
+- With the Assistant open on an Android phone, Pinky no longer tells the agent that the app behind it is hidden from accessibility. Thanks @pseudoyu.
+
+## 2026.1122.3 (2026-11-22)
+
+- On phones that keep an app's screen from accessibility services, such as WeChat on ColorOS 17, Pinky now names the app and reads its text by OCR, and tells the agent why it gets text only. Screenshots of the app follow its rules, as for any other app. Thanks @ECxiaozong for reporting it.
+
+## 2026.1122.2 (2026-11-22)
+
+- `pinky <command> -h`, `--help` and `help` now print the usage and exit with status 0 instead of 2 (1 for `pinky helper`), so scripts no longer take asking for help as a failure. `pinky task` with a missing or wrong subcommand still exits with 2. Thanks @6moran.
+
+## 2026.1122.1 (2026-11-22)
+
+- Opening a background display on an Android phone reached over a slow network, such as Tailscale, no longer times out: Pinky now copies its screen helper to the phone once instead of every time. Thanks @garryforreg for reporting it.
+
+## 2026.1121.10 (2026-11-21)
+
+- Typing a tailnet address for an Android phone now works when the phone reaches the tailnet through a VPN app that runs Tailscale itself, such as sing-box, instead of saying the address isn't on the phone's VPN. Thanks @crown3 for reporting it.
+
+## 2026.1121.9 (2026-11-21)
+
+- Routing an Android phone over the cable now works when another app on the computer uses Pinky's proxy port, and Settings › Phones names the port when one is taken.
+- A page that keeps reconnecting to a banking or payment site now shows as one line in the phone's network traffic, with how many times it connected, and it shows up right away.
+
+## 2026.1121.8 (2026-11-21)
+
+- The Android steps for reading network traffic now include Encryption & credentials on the way to installing Pinky's certificate, and the steps to remove it now go to Trusted credentials › User: removing it from User credentials alone can leave the phone still trusting it.
+
+## 2026.1121.7 (2026-11-21)
+
+- When an Android phone connected by address never comes online, Pinky now says so every time, instead of sometimes showing a bare time-out error on a busy computer.
+
+## 2026.1121.6 (2026-11-21)
+
+- An agent that asks Pinky to run a task just as Pinky starts is no longer told that tasks run only while Pinky's window is open. Thanks @pseudoyu.
+
+## 2026.1121.5 (2026-11-21)
+
+- Typing a tailnet address by hand for an Android phone now says this computer can't reach the phone there when something answers at that address but the phone doesn't, instead of asking you to connect the phone. Thanks @pseudoyu.
+
+## 2026.1121.4 (2026-11-21)
+
+- Pinky now quits when it is told to stop (SIGTERM or Ctrl-C) just as it starts, instead of staying open until it is killed. Thanks @pseudoyu.
+
+## 2026.1121.3 (2026-11-21)
+
+- When another app comes to the front on the phone without the agent opening it (on an iPhone, for example, because you opened it yourself), the agent is now told, and its next tap or typing isn't sent into that app.
+- Use away from home on Android can now take a tailnet address you enter, for a computer that reaches your tailnet without the Tailscale app (such as a proxy with a Tailscale outbound): click Enter address… under Use away from home. Thanks @crown3 for the idea.
+
+## 2026.1121.2 (2026-11-21)
+
+- `pinky -help` now prints the help and exits successfully, like `pinky -h` and `pinky --help`. Thanks @6moran.
+
+## 2026.1121.1 (2026-11-21)
+
+- Unlocking an iPhone or iPad with Touch ID from the computer now taps "Use Passcode" on its Touch ID prompt, so the passcode can be typed. Thanks @1zyao for the report.
+
+## 2026.1120.1 (2026-11-20)
+
+- The web mirror in Safari no longer stays on "Connecting" while the phone's screen doesn't change. Thanks @pseudoyu.
+
+## 2026.1119.7 (2026-11-19)
+
+- On an iPhone, reading a screen while the phone is slow to answer (a long list in a mini-program or web page) no longer comes back with only a few elements: Pinky uses the screen the phone just sent or reads it again, and says "partial" when some elements may still be missing.
+- On an iPhone, text in a web page that has just scrolled into view is no longer left out of the screen read.
+- On an iPhone, a web page no longer jumps back to its top when Pinky reads it while the phone's accessibility service is not answering.
+- Unlocking an iPhone from the computer now finds the passcode keypad even when the phone's accessibility service is not answering.
+
+## 2026.1119.6 (2026-11-19)
+
+- A scheduled task set for a time the clocks skip when daylight saving time starts now runs just after they move forward, instead of an hour early, and no longer makes another time that day get skipped.
+
+## 2026.1119.5 (2026-11-19)
+
+- A phone you remove while it is plugged in, such as an iPhone charging from the computer, now stays off the list until you unplug it and plug it in again, instead of coming straight back.
+
+## 2026.1119.4 (2026-11-19)
+
+- An action you had allowed that was under way when Pinky crashed or was force-quit no longer shows "Waiting for you" in Activity for ever: the next start marks it as one that may have happened.
+
+## 2026.1119.3 (2026-11-19)
+
+- On Android, Pinky can now read a page that never stops changing, such as a rewards page with live counters: it says the screen is still changing, reads the text from a screenshot, and returns screenshots there, instead of failing.
+- On such pages, Back, Home and Recents work again, and Home works even when the screen cannot be read at all.
+
+## 2026.1119.2 (2026-11-19)
+
+- An approval that was waiting for you when Pinky crashed or was force-quit no longer shows "Waiting for you" in Activity for ever: the next start marks it withdrawn.
+
+## 2026.1119.1 (2026-11-19)
+
+- A task that was running when Pinky crashed or was force-quit no longer shows in Activity as running for ever: the next start ends it as failed at its last step, and Export all includes it.
+
+## 2026.1118.5 (2026-11-18)
+
+- Add phone now names the iPad on the iPhone card, "iPhone / iPad", so it is clear where to add an iPad.
+
+## 2026.1118.4 (2026-11-18)
+
+- On Windows, reading a phone's network traffic no longer leaves out a request the phone made right after you handed it back to the agent.
+
+## 2026.1118.3 (2026-11-18)
+
+- Agents can now read the web requests a phone makes during their tasks, through Pinky's own proxy. It is off for every phone until you turn on "Read network traffic" in Settings › Phones and set the phone up there. Pinky asks you first in each task, hides passwords and tokens, and never decrypts banking, payment, brokerage or password-manager apps.
+
+## 2026.1118.2 (2026-11-18)
+
+- Pinky no longer takes your iPhone's camera and microphone while nobody is using it: it shares the iPhone's screen only while you watch the phone in Pinky or an agent works on it, so the camera and voice input keep working.
+- When an app on the iPhone is using the camera or microphone, the mirror now says so, and agents are told to ask you to free them.
+
+## 2026.1118.1 (2026-11-18)
+
+- A Simulator or an emulator now says "Simulator" or "Emulator" under its name in the sidebar, so it no longer looks like a second copy of your own phone.
+- An Android TV in standby (or any phone whose screen is off without a lock screen) now shows "Screen off" on its mirror instead of seeming to connect forever; click the mirror to turn the screen on.
+- Typing on an iPhone in an app that shows a web page no longer asks to approve a different app for tasks limited to chosen apps.
+
+## 2026.1117.4 (2026-11-17)
+
+- When Pinky starts hidden on macOS, a window that opens by itself for an approval no longer takes the keyboard, so a stray Return can't answer it.
+- The floating panel now leaves room for the whole list of apps when you choose "Only the apps I choose" for a new agent.
+- The Tasks box's buttons now wrap in a narrow window instead of running past the box.
+
+## 2026.1117.3 (2026-11-17)
+
+- Choosing "Only the apps I choose" when an agent first connects no longer hides Deny and Approve in the floating panel.
+
+## 2026.1117.2 (2026-11-17)
+
+- Long-pressing a payment app's icon on the home screen (PayPal, Alipay) no longer asks for a payment approval.
+- Pinky now taps and reads the screen correctly on the iPhone Duo's inner display.
+
+## 2026.1117.1 (2026-11-17)
+
+- You can now choose where task recordings are saved, in Settings › Privacy › Recordings folder, for example on an external disk. New recordings go there; earlier ones stay where they are and still play. Use Pinky's folder switches back.
+- While the chosen folder is missing (a disk that isn't plugged in) or can't be written, recordings go to Pinky's own folder, and Settings says when the folder is missing. Pinky won't take a folder inside its own recordings folder, even through a link, and says why.
+- Recordings of tasks you delete are removed from the chosen folder too, also when the disk was unplugged or read-only at the time: Pinky removes them once it can. Delete all activity removes only Pinky's recordings there, never your other files.
+
+## 2026.1116.8 (2026-11-16)
+
+- Agents with read-only access can now type into search boxes that don't say they are one, such as Pinduoduo's.
+- When read-only stops an agent, the task card and the agent's message now say why: the agent's own access (change it in Settings › Agents), a read-only task it asked for, or Read-only mode (Settings › Safety).
+
+## 2026.1116.7 (2026-11-16)
+
+- Reading a long list on an iPhone, such as the Settings home page, no longer stops after the first screen as if the screens did not follow on. When a read does stop there, the agent is told which lines made it stop.
+
+## 2026.1116.6 (2026-11-16)
+
+- Screenshots and Checkup's "Seeing the screen" now work over USB on foldables and other phones with two screens, such as the vivo X Fold 6, and show the screen in use.
+
+## 2026.1116.5 (2026-11-16)
+
+- When the phone is unlocked outside Pinky, for example by a script, the agent's next action now goes ahead right away instead of being refused as locked for several seconds.
+
+## 2026.1116.4 (2026-11-16)
+
+- On iPhones below iOS 27, pressing Home on a locked phone now just wakes its screen. It used to report an error.
+
+## 2026.1116.3 (2026-11-16)
+
+- On iPhones below iOS 27, agents can now press the arrow keys (and Page Up / Page Down), for example to move the caret in a text field or turn pictures in Photos. They used to be reported as not supported.
+
+## 2026.1116.2 (2026-11-16)
+
+- On an iPhone, a swipe now scrolls by about its length instead of flinging past whole screens, so agents no longer skip rows.
+- Agents can now read a long list on iPhone screens that don't mark it as a list, such as the main page of Settings.
+- Agents can now name iPhone system apps such as Settings, Photos and Clock in English on a phone set to another language.
+
+## 2026.1116.1 (2026-11-16)
+
+- In a narrow Tasks panel, the task limit beside the buttons no longer shrinks to one letter a line: the buttons move below it when there isn't room.
+- An Android phone on its cable that is also paired over Wireless debugging no longer shows up a second time as an offline phone with an address for a name.
+
+## 2026.1115.11 (2026-11-15)
+
+- When Pinky switches an iPhone to Pinky on the iPhone during a task, such as for a banking app that refuses screen sharing, the phone's page now says it is changing the connection and that the agent on your computer keeps doing the task. It used to read as if the task moved to the phone.
+
+## 2026.1115.10 (2026-11-15)
+
+- On Linux desktops that bind shortcuts for apps (KDE on Wayland), Pinky now shows the keys Stop all really has next to it, and none when the shortcut has no keys. The desktop now calls the shortcut "Stop all" instead of "Ctrl+Alt+.".
+
+## 2026.1115.9 (2026-11-15)
+
+- Tapping Send in a chat no longer asks as a payment just because the chat shows prices. It counts as a commit, so your rules for commits still apply.
+- Sending a red packet (发红包, 塞钱进红包, 发送红包) now counts as a payment, so Pinky asks you first. Opening or claiming one you were sent asks nothing.
+
+## 2026.1115.8 (2026-11-15)
+
+- Quitting Pinky now keeps it closed: agents (and anything that starts `pinkyctl mcp` or `pinkyctl task` again, such as an MCP manager reconnecting) no longer start it in the background until you open Pinky yourself. They're told you quit it and pick up where they were once you open it.
+
+## 2026.1115.7 (2026-11-15)
+
+- "Only the apps I choose" now lists your phone's apps to tick, on a first-connection card and in Settings › Agents, in place of a field for typing their names. The apps the agent asked for are ticked already, and a name that matches no app on the phone is shown as such instead of being saved.
+
+## 2026.1115.6 (2026-11-15)
+
+- On Android, the pill that shows while a task runs or your computer uses the phone now shrinks to a small dot at the edge of the screen after a few seconds, so it no longer covers the app. Tap the dot to see the pill again, and drag it wherever you like.
+
+## 2026.1115.5 (2026-11-15)
+
+- The first time an agent connects to an iPhone after Pinky is installed or updated, it no longer waits about 30 seconds for text recognition to load: Pinky starts loading it as soon as the phone is connected. Thanks @Dshuishui.
+
+## 2026.1115.4 (2026-11-15)
+
+- Background displays now work on Samsung phones whose screen is off: Pinky misread how these phones report their screen's power, so a task with the phone locked ran on its own screen instead.
+
+## 2026.1115.3 (2026-11-15)
+
+- On Android, touching the phone while an agent's task is still opening its background display, or just after the phone reconnected, no longer pauses that task and the agent's next ones until you click Hand back.
+
+## 2026.1115.2 (2026-11-15)
+
+- Agents can now hand Ask Pinky a task (phone_task_run, pinkyctl task run) when its model comes from DeepSeek or another service with a key of its own, or from a server on your computer; before, Pinky said it had no API key.
+
+## 2026.1115.1 (2026-11-15)
+
+- An agent set to Only the apps I choose with no app listed can no longer use any app, as Settings › Agents says; before, it could use all of them. Settings no longer saves that choice without an app.
+
+## 2026.1114.5 (2026-11-14)
+
+- A phone can now have a window of its own: choose Open in a window in its ⋯ menu or right-click menu. The window shows only the phone's live screen and keys and works like the phone's page: a click takes over and Hand back gives it back. It keeps the screen's shape as you resize it and can stay on top of other windows.
+
+## 2026.1114.4 (2026-11-14)
+
+- Screen recordings of tasks now take several times less space: once a task ends, Pinky makes its recording smaller and every step stays readable. Settings › Privacy › Recording size is Smaller by default; choose Original to keep the phone's full picture. Recordings made before this release stay as they are.
+
+## 2026.1114.3 (2026-11-14)
+
+- You can now delete a single task from Activity: choose Delete in its More actions menu. Its steps, approvals, screenshots and screen recording are removed from this computer. A running task can be deleted once it ends.
+
+## 2026.1114.2 (2026-11-14)
+
+- Ask Pinky now works with OpenAI's GPT-6 models, such as GPT-6.1 Terra, which use tools only through OpenAI's Responses API. Other OpenAI-compatible services switch to it by themselves when a model needs it.
+- Checking a model no longer says it answered without using a tool when the service refused the request: it shows what the service said and what to do.
+- GPT-6.1 Terra and GPT-6.1 Sol join GPT-5.6 Terra in OpenAI's suggested models; GPT-5.6 Terra stays the default.
+
+## 2026.1114.1 (2026-11-14)
+
+- Typing on an iPhone connected through Pinky on the iPhone (WebDriverAgent) is now several times faster: a long sentence goes in about half a second instead of appearing one character at a time.
+
+## 2026.1113.18 (2026-11-13)
+
+- While an agent waits on a task it handed Pinky with phone_task_wait, each step now arrives with its own line and the same number as in the task's step list; before, a step could show the line of the step before it. Thanks @pseudoyu.
+
+## 2026.1113.17 (2026-11-13)
+
+- Buttons, menus and sidebar rows now show when you press them, and the update card no longer breaks the version across two lines.
+- Pages, new requests and task steps now arrive with a short, calm fade or slide. With Reduce motion turned on in the system, they only fade.
+- New icons throughout the app, and every row of a phone's menus now has one. An offline phone last connected by USB shows a cable.
+
+## 2026.1113.16 (2026-11-13)
+
+- You can let agents type passwords and one-time codes on emulators and Simulators, to test sign-ins with test accounts: Settings › Safety › Allow passwords on virtual phones (off by default). On real phones they never can. Thanks @ljh740.
+
+## 2026.1113.15 (2026-11-13)
+
+- Scripts can now hand Ask Pinky a task from a terminal with `pinkyctl task run "…"`, follow it with `status`, `steer`, `cancel` and `list`, and tell how it went from the exit status. Each script shows up as an agent of its own in Settings › Agents (name it with `-as`). Thanks @ljh740.
+
+## 2026.1113.14 (2026-11-13)
+
+- Android emulators that are gone for 10 minutes now leave Pinky's phone list instead of piling up offline, unless Pinky started them from Add phone or you gave them a setting of their own. Thanks @ljh740.
+
+## 2026.1113.13 (2026-11-13)
+
+- Pinky on the computer no longer holds on to step screenshots after you stop looking at them, so it uses less memory over a day of tasks. Thanks @ljh740.
+
+## 2026.1113.12 (2026-11-13)
+
+- Ask Pinky and Pinky on your phone can now remember things for later tasks. After a task it may suggest a note, such as a preference you told it or a quicker way through an app, and keeps it only if you choose Remember. See, edit or delete notes, or turn memory off, in Settings › Agents › Memory on the computer and Settings › Memory in the phone apps. Notes never hold passwords, codes, card, account, ID or phone numbers, or addresses, and each device keeps its own.
+- Ask Pinky and Pinky on your phone now know their way around WeChat, Alipay, Meituan, Taobao, Xiaohongshu, Amap, Google Maps, Apple Maps, Clock, Calculator and Settings: they read a short guide when they open one of them.
+
+## 2026.1113.11 (2026-11-13)
+
+- Tasks for Pinky can now be scheduled: once, daily, on weekdays, weekly or every few hours, or only to tell you when a condition holds. Scheduled tasks run on the computer and on Android (not on iPhone); while nobody watches they never pay, ask for approvals by notification, and skip, with a note, when the phone is locked, in use or off.
+- On Android, an optional floating button asks Pinky about what the screen shows: double-tap to type a question, touch and hold to speak it. Turn it on in Settings › This phone or from its Quick Settings tile.
+- Share text, links and pictures from other Android apps to Pinky to start a task with them.
+- Pinky's Quick Settings tiles on Android start a new task or turn the floating button on and off.
+- Speak a task instead of typing it, in Pinky on Android and on the iPhone.
+- On the iPhone, the New task in Pinky shortcut opens Pinky with a task, and text or a link from the share sheet, ready to start.
+- Ask Pinky on the computer has an About the screen button that starts a task about what the phone shows now.
+
+## 2026.1113.10 (2026-11-13)
+
+- Agents can hand Pinky's own agent a whole task with the new phone_task_run, follow it with phone_task_wait, phone_task_status and phone_task_list, add to it or continue it with phone_task_steer, and cancel it with phone_task_cancel. The task works as that agent, within its access and your rules, and shows in Ask Pinky with the agent's name, where you can message or continue it too.
+- Ask Pinky now has ready-made settings for DeepSeek, Qwen, Kimi, Zhipu GLM, SiliconFlow, Volcengine Ark, OpenRouter, Anthropic, OpenAI, Gemini, Ollama and LM Studio, each with its own key, model and address.
+- Saving a key, model or address now checks the model right away and says clearly what went wrong.
+- Settings shows how many tokens Pinky's own agent used today, in the last 7 days and in the last 30, by service and model, with the cost where the price is known; the task box shows today's. It stays on your device.
+- Pinky on Android and iPhone offers the same services, the check and the usage.
+
+## 2026.1113.9 (2026-11-13)
+
+- While Pinky's own agent works on a task, you can send it a message from Ask Pinky on the computer or from the task screen on the phone, and edit or withdraw it until Pinky reads it.
+- After a task ends, Continue lets Pinky carry on with the same task from a new message; its limits count anew.
+- Pinky on Android can run its tasks on a hidden background screen and show them in a small floating window, so you keep using your phone meanwhile. Turn it on in Settings › Background screen (Android 13 and later, with Wireless debugging).
+
+## 2026.1113.8 (2026-11-13)
+
+- Pinky on Android now shows a task's steps, approval cards and the phone's status in the app's language (Chinese or Japanese) instead of English.
+
+## 2026.1113.7 (2026-11-13)
+
+- The iPhone mirror no longer looks too bright: whites no longer clip and dark parts are no longer crushed to black. Thanks @shrderek.
+- Pinky on the iPhone now has its own icon on the home screen, in notifications and in the Live Activity, instead of a blank one.
+- Pinky's logo now shows next to the title on the task screen of both phone apps.
+
+## 2026.1113.6 (2026-11-13)
+
+- On an iPhone with two screens, Home now says it may not have worked when neither the Home button nor the swipe up changed the screen, instead of reporting success.
+- On an iPhone with two screens, taps that keep changing nothing are now reported as uncertain, even after an earlier tap worked.
+
+## 2026.1113.5 (2026-11-13)
+
+- Ask Pinky and Pinky on the phone now work with Gemini models through Google AI Studio's OpenAI-compatible API, which refused every step after the first.
+
+## 2026.1113.4 (2026-11-13)
+
+- phone_device no longer fails on Android 13 and later phones whose dark theme turns on at set times or at bedtime.
+
+## 2026.1113.3 (2026-11-13)
+
+- Scrolling a list from a button in it (such as Delete order in an order list) is now just a scroll: Pinky no longer asks you about it as a payment, or refuses it in read-only mode.
+- Pressing Stop on Pinky's floating status on Android right after its accessibility service restarted no longer stalls and fails.
+
+## 2026.1113.2 (2026-11-13)
+
+- Ask Pinky and Pinky on the phone now work with OpenCode Go's OpenAI-compatible service, which refused every task asking for a session header.
+
+## 2026.1113.1 (2026-11-13)
+
+- Pinky on your Android phone can now do tasks by itself: type what you want in Pinky on the phone, with your own model key, and watch it work. Pinky on the phone is now one app.
+- Both phone apps are now simply called Pinky.
+- Pinky on the iPhone has a new look that matches Pinky on Android: setup, model and key, running a task, approvals and Activity.
+- A task done on the phone now writes its summary in the language of the task.
+- Starting a task on your Android phone no longer fails once after Android restarts Pinky's accessibility service.
+- Pinky on your computer now tells you that Pinky on the phone can do tasks by itself and how to set it up, on the phone's card and in Settings › Phones.
+
 ## 2026.1112.16 (2026-11-12)
 
 - Pinky Helper is now called Pinky for iPhone, and it speaks English, Simplified Chinese and Japanese.

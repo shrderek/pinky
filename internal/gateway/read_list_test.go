@@ -31,13 +31,29 @@ type readListDevice struct {
 	reverse      bool
 	ocrOnly      []screen.Element
 	sawOCR       bool
-	afterSwipe   func()
+	// lineRole is the role of the list's lines, text by default; froms
+	// are where the swipes started.
+	lineRole   string
+	froms      []screen.Point
+	afterSwipe func()
 	// failAfter makes reads fail once that many swipes went out; waits
 	// counts WaitSettled calls.
 	failAfter, swipes, waits int
+	// ragged gives the lines differing widths, as a web page's text has;
+	// clock makes reads with OCR find the status bar's clock, as an
+	// iPhone's do; reads counts the reads other than those that check a
+	// finger's spot with all OCR text (OCRAll).
+	ragged, clock bool
+	reads         int
+	// still keeps each page's lines where the page before had its own:
+	// a swipe that moved the list by whole rows.
+	still bool
 }
 
 func (d *readListDevice) Observe(ctx context.Context, opt driver.ObserveOptions) (*screen.Screen, error) {
+	if !opt.OCRAll {
+		d.reads++
+	}
 	if d.failAfter > 0 && d.swipes >= d.failAfter {
 		return nil, errors.New("screen read failed")
 	}
@@ -86,12 +102,27 @@ func (d *readListDevice) Observe(ctx context.Context, opt driver.ObserveOptions)
 		if d.reverse {
 			shift = d.page * 5
 		}
+		if d.still {
+			shift = 0
+		}
+		role := d.lineRole
+		if role == "" {
+			role = screen.RoleText
+		}
+		w := 700
+		if d.ragged {
+			w = 400 + (i%3)*200
+		}
 		s.Elements = append(s.Elements, screen.Element{
-			Role: screen.RoleText, Label: text,
-			Bounds: screen.Rect{X: 120, Y: 300 + i*step + shift, W: 700, H: 80},
+			Role: role, Label: text,
+			Bounds: screen.Rect{X: 120, Y: 300 + i*step + shift, W: w, H: 80},
 		})
 	}
 	s.Elements = append(s.Elements, d.overlay...)
+	if opt.OCR && d.clock {
+		s.Elements = append(s.Elements, screen.Element{Role: screen.RoleText, Label: "9:41", Source: screen.SourceOCR,
+			Bounds: screen.Rect{X: 80, Y: 30, W: 110, H: 50}})
+	}
 	if opt.OCR && opt.OCRAll {
 		d.sawOCR = true
 		s.Elements = append(s.Elements, d.ocrOnly...)
@@ -108,6 +139,7 @@ func (d *readListDevice) Swipe(ctx context.Context, from, to screen.Point, _ tim
 		}
 	}
 	d.swipes++
+	d.froms = append(d.froms, from)
 	if (d.reverse && from.Y < to.Y) || (!d.reverse && from.Y > to.Y) {
 		if d.page+1 < len(d.pages) {
 			d.page++
@@ -408,6 +440,11 @@ func TestReadListContinuation(t *testing.T) {
 	if got := scanText(two.Scan); !strings.Contains(got, "fifth long title") {
 		t.Fatalf("continued content missing: text=%q scan=%+v", got, two.Scan)
 	}
+	// The continuation reads the screen the first call ended on again, and
+	// finds the next screen's overlap with it.
+	if got := scanText(two.Scan); strings.Contains(got, "third long title") || strings.Contains(got, "fourth long title") {
+		t.Fatalf("continuation repeats lines already read: text=%q scan=%+v", got, two.Scan)
+	}
 }
 
 func TestReadListAutoSelectsTheLargestList(t *testing.T) {
@@ -532,9 +569,11 @@ func TestReadListStopsBeforeProtectedControl(t *testing.T) {
 	dev := &readListDevice{
 		Device: base,
 		pages:  [][]string{{"first long title", "second long title"}, {"second long title", "third long title"}},
+		// A slider that runs along the list: a swipe that scrolls the
+		// list may slide it.
 		overlay: []screen.Element{{
-			Role: screen.RoleButton, Label: "Place order · $12.80",
-			Bounds: screen.Rect{X: 0, Y: 1500, W: 1080, H: 500},
+			Role: screen.RoleOther, Label: "Slide to pay $12.80",
+			Bounds: screen.Rect{X: 0, Y: 800, W: 1080, H: 1200},
 		}},
 	}
 	g := newDevGateway(t, base, dev)
@@ -806,6 +845,201 @@ func TestReadListUsesExplicitScrollAreaWithoutListElement(t *testing.T) {
 	}
 }
 
+// GitHub issue #148: iOS 27 lists Settings' rows but no list or scrollable
+// element around them. With no ref or scroll_area, the read takes the
+// column of rows as the area to scroll, swipes inside it and reads on.
+func TestReadListFallsBackToAColumnOfRows(t *testing.T) {
+	base := demo.NewDevice("iphone", "iPhone", driver.IOS)
+	rows := []string{
+		"Apple Account, iCloud", "Airplane Mode", "Wi-Fi, Home", "Bluetooth, On", "Cellular", "Personal Hotspot",
+		"Battery", "VPN", "General", "Accessibility", "Action Button", "Camera",
+		"Control Center", "Display & Brightness", "Home Screen & App Library", "Search", "Siri", "StandBy",
+	}
+	dev := &readListDevice{
+		Device:   base,
+		app:      screen.App{ID: "com.apple.Preferences", Name: "Ajustes"},
+		noList:   true,
+		lineRole: screen.RoleButton,
+		lineStep: 140,
+		pages:    [][]string{rows[0:8], rows[5:13], rows[10:18]},
+	}
+	g := newDevGateway(t, base, dev)
+	s, _ := connect(t, g, "Read Settings")
+	res := s.ReadList(context.Background(), ReadListRequest{MaxScreens: 3, MaxMS: 5000, OCR: "off"})
+	if res.Error != "" || res.Scan == nil || res.Scan.Pages != 3 || res.Scan.Swipes != 2 {
+		t.Fatalf("read: %+v", res)
+	}
+	var got []string
+	for _, page := range res.Scan.Sections {
+		got = append(got, page.Lines...)
+	}
+	if !reflect.DeepEqual(got, rows) {
+		t.Fatalf("lines = %#v, want %#v", got, rows)
+	}
+	// The swipes run inside the rows' column, upwards.
+	for _, p := range dev.froms {
+		if p.X < 120 || p.X >= 820 || p.Y < 300 || p.Y > 300+8*140 {
+			t.Errorf("a swipe started at %v, outside the rows", p)
+		}
+	}
+	// A continuation reads on in the same column.
+	if res.Scan.Continuation == "" {
+		t.Fatalf("no continuation: %+v", res.Scan)
+	}
+}
+
+// The fallbacks take only a column of like rows, or a page of text rows:
+// a screen without a list whose elements are few, or a grid of buttons
+// (icons), still has no list to read.
+func TestReadListFindsNoColumnWithoutRows(t *testing.T) {
+	grid := make([]screen.Element, 0, 24)
+	for i := range 24 {
+		grid = append(grid, screen.Element{Role: screen.RoleButton, Label: fmt.Sprintf("App %d", i),
+			Bounds: screen.Rect{X: 60 + (i%4)*250, Y: 300 + (i/4)*300, W: 200, H: 220}})
+	}
+	for name, c := range map[string]struct {
+		lines   []string
+		overlay []screen.Element
+	}{
+		"few rows":       {lines: []string{"first long title", "second long title", "third long title"}},
+		"a grid":         {overlay: grid},
+		"nothing at all": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := demo.NewDevice("iphone", "iPhone", driver.IOS)
+			dev := &readListDevice{Device: base, noList: true, overlay: c.overlay, pages: [][]string{c.lines}}
+			g := newDevGateway(t, base, dev)
+			s, _ := connect(t, g, "Read")
+			res := s.ReadList(context.Background(), ReadListRequest{MaxScreens: 2, MaxMS: 5000, OCR: "off"})
+			if res.Error != ErrNotFound || dev.swipes != 0 {
+				t.Fatalf("read without a list: %+v, %d swipes", res, dev.swipes)
+			}
+		})
+	}
+}
+
+// webPage is a page of text as a web view on an iPhone through
+// WebDriverAgent lists it: lines of differing widths, and no element for
+// the view or its scrolling.
+func webPage() [][]string {
+	lines := webLines()
+	return [][]string{lines[0:8], lines[4:12], lines[8:14]}
+}
+
+func webLines() []string {
+	lines := make([]string, 14)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("Bill item %d, paid at the corner shop", i+1)
+	}
+	return lines
+}
+
+// A web page with no list or scrollable element, and lines too unlike to
+// make a column of rows (a bank's bill page in a field test answered
+// not_found): the read scrolls the screen's content and says so.
+func TestReadListReadsAWebPageWithoutAList(t *testing.T) {
+	base := demo.NewDevice("iphone", "iPhone", driver.IOS)
+	dev := &readListDevice{Device: base, noList: true, ragged: true, lineStep: 180, pages: webPage()}
+	g := newDevGateway(t, base, dev)
+	s, _ := connect(t, g, "Read a bill")
+	res := s.ReadList(context.Background(), ReadListRequest{MaxScreens: 3, MaxMS: 5000, OCR: "off"})
+	if res.IsError() || res.Scan == nil || res.Scan.Pages != 3 || res.Scan.Swipes != 2 {
+		t.Fatalf("web page: %+v", res)
+	}
+	var got []string
+	for _, page := range res.Scan.Sections {
+		got = append(got, page.Lines...)
+	}
+	if want := webLines(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("lines = %#v, want %#v", got, want)
+	}
+	if !strings.Contains(res.Message, "scrolled the screen's content") {
+		t.Fatalf("the message does not say where the read scrolled: %s", res.Message)
+	}
+	// The swipes run between the bars at the top and bottom eighths.
+	for _, p := range dev.froms {
+		if p.Y < 2400/8 || p.Y > 2400*7/8 {
+			t.Errorf("a swipe started at %v, outside the screen's content", p)
+		}
+	}
+}
+
+// The home screen and other system UI are never read as a page, however
+// much text they show.
+func TestReadListLeavesTheHomeScreenAlone(t *testing.T) {
+	base := demo.NewDevice("iphone", "iPhone", driver.IOS)
+	dev := &readListDevice{Device: base, noList: true, ragged: true, lineStep: 180, pages: webPage(),
+		app: screen.App{ID: "com.apple.springboard", Name: "Home Screen"}}
+	g := newDevGateway(t, base, dev)
+	s, _ := connect(t, g, "Read")
+	res := s.ReadList(context.Background(), ReadListRequest{MaxScreens: 2, MaxMS: 5000, OCR: "off"})
+	if res.Error != ErrNotFound || dev.swipes != 0 {
+		t.Fatalf("home screen: %+v, %d swipes", res, dev.swipes)
+	}
+}
+
+func TestContentArea(t *testing.T) {
+	page := func(n, top int) *screen.Screen {
+		s := &screen.Screen{Width: 1080, Height: 2400}
+		for i := range n {
+			s.Elements = append(s.Elements, screen.Element{Role: screen.RoleText, Label: fmt.Sprintf("line %d", i),
+				Bounds: screen.Rect{X: 60, Y: top + i*200, W: 300 + (i%4)*150, H: 60}})
+		}
+		return s
+	}
+	if got, ok := contentArea(page(8, 400)); !ok || got != (screen.Rect{X: 0, Y: 300, W: 1080, H: 1800}) {
+		t.Fatalf("a page of text: %v, %v", got, ok)
+	}
+	// The keyboard takes the bottom of the screen: the content ends above it.
+	kb := page(8, 400)
+	kb.Keyboard, kb.KeyboardFrame = true, screen.Rect{X: 0, Y: 1600, W: 1080, H: 800}
+	if got, ok := contentArea(kb); !ok || got != (screen.Rect{X: 0, Y: 300, W: 1080, H: 1300}) {
+		t.Fatalf("above the keyboard: %v, %v", got, ok)
+	}
+	// Five lines, or lines bunched at the top (a short form), are no page.
+	if _, ok := contentArea(page(5, 400)); ok {
+		t.Fatal("five lines read as a page")
+	}
+	bunched := page(8, 400)
+	for i := range bunched.Elements {
+		bunched.Elements[i].Bounds.Y = 400 + i*100
+	}
+	if _, ok := contentArea(bunched); ok {
+		t.Fatal("lines over less than half the screen read as a page")
+	}
+	// Buttons are not text: a grid of them is no page.
+	buttons := page(8, 400)
+	for i := range buttons.Elements {
+		buttons.Elements[i].Role = screen.RoleButton
+	}
+	if _, ok := contentArea(buttons); ok {
+		t.Fatal("buttons read as a page")
+	}
+}
+
+// rowColumn takes the box around the rows, a cell and the label of the
+// same size inside it counting once.
+func TestRowColumn(t *testing.T) {
+	s := &screen.Screen{Width: 1320, Height: 2868}
+	for i := range 10 {
+		b := screen.Rect{X: 48, Y: 600 + i*150, W: 1224, H: 130}
+		s.Elements = append(s.Elements,
+			screen.Element{Role: screen.RoleButton, Label: fmt.Sprintf("Row %d", i), Bounds: b},
+			screen.Element{Role: screen.RoleText, Label: fmt.Sprintf("Row %d", i), Bounds: screen.Rect{X: 50, Y: b.Y + 2, W: 1220, H: 126}},
+			screen.Element{Role: screen.RoleImage, Bounds: screen.Rect{X: 60, Y: b.Y + 20, W: 90, H: 90}})
+	}
+	// The navigation bar's title and the search field are not rows.
+	s.Elements = append(s.Elements,
+		screen.Element{Role: screen.RoleText, Label: "Ajustes", Bounds: screen.Rect{X: 48, Y: 250, W: 400, H: 120}},
+		screen.Element{Role: screen.RoleInput, Label: "Buscar", Bounds: screen.Rect{X: 48, Y: 420, W: 1224, H: 110}},
+		screen.Element{Role: screen.RoleText, Label: "row read by OCR", Source: screen.SourceOCR, Bounds: screen.Rect{X: 48, Y: 2200, W: 1224, H: 130}})
+	got, ok := rowColumn(s)
+	want := screen.Rect{X: 48, Y: 600, W: 1224, H: 9*150 + 130}
+	if !ok || got != want {
+		t.Fatalf("rowColumn = %v, %v; want %v", got, ok, want)
+	}
+}
+
 func TestReadListReadsBackwardsWithoutLoss(t *testing.T) {
 	base := demo.NewDevice("pixel", "Pixel 9", driver.Android)
 	dev := &readListDevice{
@@ -860,11 +1094,11 @@ func TestReadListChecksOCROnlyProtectedSwipeTarget(t *testing.T) {
 		pages:  [][]string{{"first long title", "second long title"}, {"second long title", "third long title"}},
 		overlay: []screen.Element{{
 			Role:   screen.RoleOther,
-			Bounds: screen.Rect{X: 0, Y: 1500, W: 1080, H: 500},
+			Bounds: screen.Rect{X: 0, Y: 800, W: 1080, H: 1200},
 		}},
 		ocrOnly: []screen.Element{{
 			Role: screen.RoleText, Label: "Slide to pay $12.80", Source: screen.SourceOCR,
-			Bounds: screen.Rect{X: 200, Y: 1650, W: 680, H: 120},
+			Bounds: screen.Rect{X: 0, Y: 850, W: 1080, H: 1100},
 		}},
 	}
 	g := newDevGateway(t, base, dev)

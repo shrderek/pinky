@@ -10,10 +10,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -24,6 +26,7 @@ import (
 	"github.com/DIYgod/pinky/internal/gateway"
 	"github.com/DIYgod/pinky/internal/pilot"
 	"github.com/DIYgod/pinky/internal/policy"
+	"github.com/DIYgod/pinky/internal/schedule"
 	"github.com/DIYgod/pinky/internal/screen"
 	"github.com/DIYgod/pinky/internal/secret"
 	"github.com/DIYgod/pinky/internal/update"
@@ -76,6 +79,9 @@ func runApp(args []string) error {
 	// crash file before the runtime wrote the panic to it.
 	defer func() { crashes.Exit(recover()) }()
 	c.Crashes = crashes
+	// Opened by the person, Pinky may be started by agents again
+	// (quitmark.go), even when another Pinky shows its window instead.
+	appStarted(dirs, *background, c.Fake, c.Log)
 
 	settingsPath := filepath.Join(dirs.Config, "settings.json")
 	settings := loadSettings(settingsPath, c.Log)
@@ -129,6 +135,48 @@ func runApp(args []string) error {
 	defer tel.Close()
 	// `pinky quit` quits the app as its menu would.
 	rg.srv.Quit = func() { mygo.App.Quit() }
+
+	// Ask Pinky: Pinky's own agent, a client of the same MCP server as
+	// any agent. Its API keys stay in the keychain until a task starts;
+	// the notes the person keeps for it are this computer's own.
+	memories, err := pilot.OpenMemories(filepath.Join(dirs.Data, "memory.json"))
+	if err != nil {
+		c.Log.Error("memory", "err", err)
+		memories, _ = pilot.OpenMemories("")
+	}
+	ask := pilot.New(pilot.Options{
+		Server:  rg.MCP,
+		Version: version,
+		Key: func(ctx context.Context, name string) (string, error) {
+			return secret.Get(ctx, secret.System(), secret.ModelKeyAccount(name))
+		},
+		Describe: ui.DescribePilot,
+		// What it used, by day, service and model, on this computer only.
+		Usage:    pilot.OpenUsage(filepath.Join(dirs.Data, "model-usage.json")),
+		Memories: memories,
+		// The OpenAI-compatible models that call tools only through the
+		// Responses API, as their services said.
+		APIs: pilot.OpenAPIs(filepath.Join(dirs.Data, "model-apis.json")),
+		Blocked: func(a screen.App) bool {
+			_, blocked := rg.Policy.Blocked(a)
+			return blocked
+		},
+	})
+	defer ask.Close()
+	// Agents may hand Pinky's own agent a whole task (phone_task_run),
+	// with the model and limits of Ask Pinky, while this window is open
+	// for the person to follow it.
+	var askCfg atomic.Pointer[ui.Settings]
+	// A copy: the client changes settings on its own thread.
+	first := settings
+	askCfg.Store(&first)
+	rg.MCP.SetTasks(ask.ForAgents(func() (pilot.Config, bool) {
+		s := askCfg.Load()
+		return s.PilotConfig(), s.AskPinky
+	}))
+	defer rg.MCP.SetTasks(nil)
+	// Agents come in only now: an agent that comes as Pinky starts would
+	// be told before SetTasks that tasks run only while the window is open.
 	go func() {
 		if err := rg.Serve(ctx); err != nil && ctx.Err() == nil {
 			c.Log.Error("agent socket stopped", "err", err)
@@ -138,17 +186,23 @@ func runApp(args []string) error {
 	// Agents' copies of Pinky's skill follow this version.
 	go refreshSkills(c.Log)
 	gatewaySettings(&settings, rg)
-	// Ask Pinky: Pinky's own agent, a client of the same MCP server as
-	// any agent. Its API keys stay in the keychain until a task starts.
-	ask := pilot.New(pilot.Options{
-		Server:  rg.MCP,
-		Version: version,
-		Key: func(ctx context.Context, provider string) (string, error) {
-			return secret.Get(ctx, secret.System(), secret.ModelKeyAccount(provider))
-		},
-		Describe: ui.DescribePilot,
-	})
-	defer ask.Close()
+	// Ask Pinky's scheduled tasks; they run while the app runs.
+	schedules, err := schedule.Open(filepath.Join(dirs.Data, "schedules.json"))
+	if err != nil {
+		c.Log.Warn("open the scheduled tasks", "err", err)
+	}
+	// Whether the person quits Pinky, or the system or a signal makes it
+	// quit (quitmark.go). MyGo quits on SIGINT and SIGTERM as from the
+	// menu; this channel hears them too.
+	var quit quitIntent
+	quit.watch()
+	signals := make(chan os.Signal, 1)
+	for _, s := range []os.Signal{os.Interrupt, syscall.SIGTERM} {
+		if !signal.Ignored(s) { // as MyGo does
+			signal.Notify(signals, s)
+		}
+	}
+	defer signal.Stop(signals)
 	ready := false
 	err = ui.Run(clientAPI(rg, tel, c.Fake), ui.Options{
 		BindShow: func(f func()) { show.Store(&f) },
@@ -158,9 +212,11 @@ func runApp(args []string) error {
 		Settings: &settings,
 		// The client's own lines, as the app's log: what the person's
 		// feedback carries.
-		Log:   c.Log,
-		Pilot: ask,
+		Log:       c.Log,
+		Pilot:     ask,
+		Schedules: schedules,
 		OnSettings: func(old, s ui.Settings) {
+			askCfg.Store(&s)
 			applySettings(rg, old, s, c.Log)
 			applyTelemetry(tel, s)
 			unlock.on.Store(s.UnlockFromComputer)
@@ -190,6 +246,7 @@ func runApp(args []string) error {
 			if err := swapped.Confirm(); err != nil {
 				c.Log.Warn("update: confirm", "err", err)
 			}
+			quit.earlySignal(signals, mygo.App.Quit)
 		},
 	})
 	if err != nil && *background && !ready {
@@ -214,6 +271,13 @@ func runApp(args []string) error {
 	}
 	// Read after MarkRestart above, so a handover keeps adb for the daemon.
 	restarting = update.Restarting(dirs.Config)
+	select {
+	case <-signals:
+		quit.signalled()
+	default:
+	}
+	// Before the gateway closes, so no new shim starts Pinky meanwhile.
+	afterQuit(dirs, &quit, restarting, c.Fake, err, c.Log)
 	return err
 }
 
@@ -282,6 +346,7 @@ func gatewaySettings(s *ui.Settings, rg *runningGateway) {
 		s.Preset = int(p)
 	}
 	s.HideCodes = rg.Policy.HideCodes()
+	s.VirtualCredentials = rg.Policy.VirtualCredentials()
 	s.ReadOnly = rg.Policy.ReadOnly("")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -327,9 +392,13 @@ func settingsVersion(policyVersion int, devices []gateway.DeviceView) int {
 }
 
 // startSettings applies what the gateway takes from Settings at start:
-// recording, retention, iPhones over Wi-Fi and remote agents.
+// recording and its folder, retention, iPhones over Wi-Fi and remote agents.
 func startSettings(rg *runningGateway, s ui.Settings, log *slog.Logger) {
+	if err := rg.G.SetRecordingsDir(s.RecordingsDir); err != nil {
+		log.Warn("settings: recordings folder", "err", err)
+	}
 	rg.G.SetRecording(s.Record)
+	rg.G.SetSmallerRecordings(s.SmallerRecordings)
 	rg.G.SetRetention(s.KeepDays)
 	rg.G.SetWiFi(s.IOSWiFi)
 	if s.RemoteAgents {
@@ -407,8 +476,14 @@ func applySettings(rg *runningGateway, old, s ui.Settings, log *slog.Logger) {
 			log.Warn("settings: "+what, "err", err)
 		}
 	}
+	if s.RecordingsDir != old.RecordingsDir {
+		warn("recordings folder", rg.G.SetRecordingsDir(s.RecordingsDir))
+	}
 	if s.Record != old.Record {
 		rg.G.SetRecording(s.Record)
+	}
+	if s.SmallerRecordings != old.SmallerRecordings {
+		rg.G.SetSmallerRecordings(s.SmallerRecordings)
 	}
 	if s.KeepDays != old.KeepDays {
 		rg.G.SetRetention(s.KeepDays)
@@ -434,6 +509,9 @@ func applySettings(rg *runningGateway, old, s ui.Settings, log *slog.Logger) {
 	}
 	if s.HideCodes != old.HideCodes {
 		warn("hide codes", rg.Policy.SetHideCodes(s.HideCodes))
+	}
+	if s.VirtualCredentials != old.VirtualCredentials {
+		warn("virtual credentials", rg.Policy.SetVirtualCredentials(s.VirtualCredentials))
 	}
 	if s.ReadOnly != old.ReadOnly {
 		warn("read-only", rg.G.SetReadOnly("", s.ReadOnly))

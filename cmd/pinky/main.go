@@ -32,58 +32,114 @@ var version = "0.0.0-dev"
 
 func main() {
 	ios.PinkyVersion = version // the iPhone app kit of this release
-	cmd := "app"
-	args := os.Args[1:]
-	if len(args) > 0 && (!strings.HasPrefix(args[0], "-") || isCommandFlag(args[0])) {
-		cmd, args = args[0], args[1:]
+	cmd, args := commandOf(os.Args[1:])
+	err := dispatch(cmd, args)
+	if err == nil {
+		return
 	}
-	var err error
+	switch {
+	case errors.Is(err, errUnknownCommand):
+		usage()
+	case errors.Is(err, flag.ErrHelp):
+		// The command printed its usage because the command line asked
+		// for it (-h, --help, help).
+	default:
+		var ee *exitError
+		if errors.As(err, &ee) {
+			// A usage error that printed itself (taskUsageError) has
+			// nothing left to say.
+			if ee.err != nil {
+				fmt.Fprintf(os.Stderr, "pinky %s: %v\n", cmd, ee.err)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "pinky %s: %v\n", cmd, err)
+		}
+	}
+	os.Exit(exitCode(err))
+}
+
+// exitCode is how a command ends: 0 when it did what it was asked,
+// which includes printing its usage because the command line asked for
+// help, as the commands spelled as a flag (-h, --help, help) do; 2 for a
+// command Pinky does not know, and for a usage error that ends through
+// exitError; 1 for another failure.
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var ee *exitError
+	if errors.As(err, &ee) {
+		return ee.code
+	}
+	switch {
+	case errors.Is(err, flag.ErrHelp):
+		return 0
+	case errors.Is(err, errUnknownCommand):
+		return 2
+	}
+	return 1
+}
+
+// errUnknownCommand says the command line named a command Pinky does not
+// know: main prints the usage and quits 2.
+var errUnknownCommand = errors.New("unknown command")
+
+// dispatch runs the command the command line names, with its flags.
+func dispatch(cmd string, args []string) error {
 	switch cmd {
 	case "version", "--version", "-v":
 		fmt.Println("pinky", version)
-	case "help", "--help", "-h":
+		return nil
+	case "help", "--help", "-h", "-help":
 		usage()
+		return nil
 	case "app":
-		err = runApp(args)
+		return runApp(args)
 	case "daemon":
-		err = runDaemon(args)
+		return runDaemon(args)
 	case "mcp":
-		err = runMCP(args)
+		return runMCP(args)
 	case "devices":
-		err = runDevices(args)
+		return runDevices(args)
+	case "task":
+		return runTask(args)
 	case "companion":
-		err = runCompanion(args)
+		return runCompanion(args)
 	case "helper":
-		err = runHelper(args)
+		return runHelper(args)
 	case "needs":
-		err = runNeeds(args)
+		return runNeeds(args)
 	case "decide":
-		err = runDecide(args)
+		return runDecide(args)
 	case "token":
-		err = runToken(args)
+		return runToken(args)
 	case "quit":
-		err = runQuit(args)
+		return runQuit(args)
 	case "update":
-		err = runUpdate(args)
+		return runUpdate(args)
 	case "update-helper":
 		// Not for people: the app starts it from a copy of itself to
 		// install an update on Windows.
-		err = runUpdateHelper(args)
-	default:
-		usage()
-		os.Exit(2)
+		return runUpdateHelper(args)
 	}
-	if err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			os.Exit(2)
-		}
-		fmt.Fprintf(os.Stderr, "pinky %s: %v\n", cmd, err)
-		os.Exit(1)
+	return errUnknownCommand
+}
+
+// commandOf splits the command line into the command and its flags. The
+// first argument names the command unless it is a flag, which belongs to
+// the app; the commands spelled as one (--version, -help) are the
+// exception.
+func commandOf(args []string) (cmd string, rest []string) {
+	if len(args) > 0 && (!strings.HasPrefix(args[0], "-") || isCommandFlag(args[0])) {
+		return args[0], args[1:]
 	}
+	return "app", args
 }
 
 // isCommandFlag reports whether a first argument that looks like a flag is
-// really a command, such as --version.
+// really a command, such as --version. dispatch has a case for every one
+// of them; one it lacks would print the usage and quit 2, as an unknown
+// command does.
 func isCommandFlag(arg string) bool {
 	switch arg {
 	case "--version", "-v", "help", "--help", "-h", "-help":
@@ -102,18 +158,22 @@ Commands:
   (none)    start the desktop app (gateway and window); same as "app"
   daemon    run the gateway without UI
   mcp       run the MCP server on stdio (agents launch this); starts the
-            gateway when none is running
+            gateway when none is running, unless you quit Pinky
   devices   list connected phones
+  task run|status|steer|cancel|list
+            hand Ask Pinky a task from a shell and follow it, as an agent
+            named "Pinky CLI" or -as name ("pinkyctl task help")
   companion install [phone]
-            install or update Pinky for Android, Pinky's app for the phone
+            install or update Pinky on the phone, Pinky's app for Android phones
   helper install [--team ID] [--bundle-id ID] [--local-signing]
                  [--helper-only] [phone]
-            build Pinky for iPhone, Pinky's app for the iPhone, with
+            build Pinky on the iPhone, Pinky's app for the iPhone, with
             WebDriverAgent in it, with Xcode and install it on the phone
             (--helper-only: the older Pinky Helper); run it again when its
             signature runs out (macOS)
   token     print the agent token, which agents connecting over HTTP send
-  quit      quit the running Pinky (the app or the daemon)
+  quit      quit the running Pinky (the app or the daemon); agents do not
+            start it again until you open it
   update [--check]
             say whether a newer Pinky is out and install it (while Pinky
             is not running; the app updates itself)
@@ -150,6 +210,11 @@ func runQuit(args []string) error {
 	ctl.Close()
 	if err != nil {
 		return err
+	}
+	// Quit on purpose: agents do not start it again until it is opened
+	// (quitmark.go). The app notes it too; a daemon does not.
+	if err := markQuit(dirs); err != nil {
+		fmt.Fprintf(os.Stderr, "pinky quit: %v\n", err)
 	}
 	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
 		c, err := api.DialControl(dirs)

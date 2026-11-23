@@ -20,6 +20,7 @@ import (
 	"github.com/DIYgod/pinky/internal/driver"
 	"github.com/DIYgod/pinky/internal/gateway"
 	"github.com/DIYgod/pinky/internal/pilot"
+	"github.com/DIYgod/pinky/internal/schedule"
 	"github.com/DIYgod/pinky/internal/secret"
 	"github.com/DIYgod/pinky/internal/telemetry"
 	"github.com/DIYgod/pinky/internal/update"
@@ -55,7 +56,8 @@ type Options struct {
 	Settings   *Settings
 	OnSettings func(old, s Settings)
 	// GatewaySettings reads again what the gateway keeps of Settings ›
-	// Safety (Preset, HideCodes, ReadOnly and BlockedApps), which hand
+	// Safety (Preset, HideCodes, VirtualCredentials, ReadOnly and
+	// BlockedApps), which hand
 	// edits of rules.yaml and apps.yaml change while Pinky runs. since is
 	// the version of the policy it returned last, -1 at first; ok is false
 	// while the policy is still at it. The client calls it off the main
@@ -123,6 +125,10 @@ type Options struct {
 	// at the top of Tasks and its part of Settings › Agents. nil leaves
 	// them out.
 	Pilot Pilot
+	// Schedules keeps Ask Pinky's scheduled tasks, which the client runs
+	// while it runs, through a Pilot that also has StartScheduled
+	// (schedules.go); nil leaves them out.
+	Schedules *schedule.Store
 }
 
 // Pilot runs Pinky's own agent, one task a phone at a time, as
@@ -130,10 +136,38 @@ type Options struct {
 // returns at once.
 type Pilot interface {
 	Start(cfg pilot.Config, device, task string) error
+	// StartWith starts a task with what goes with it: a question about
+	// the screen the phone shows (pilot.Extra.Screen).
+	StartWith(cfg pilot.Config, device, task string, x pilot.Extra) error
 	Stop(device string)
 	StopAll()
 	Status(device string) (pilot.Status, bool)
 	Dismiss(device string)
+	// Steer, Edit and Withdraw are the person's messages to the task while
+	// it runs; Continue goes on with the task that ended (pilot.Runner).
+	Steer(device, text string) (pilot.Message, error)
+	Edit(device, id, text string) error
+	Withdraw(device, id string) error
+	Continue(device, text string) error
+	// Keep and Drop decide a note the task on device suggested, by its
+	// index in Status.Suggested; Memories are the notes kept (nil when
+	// the runner keeps none).
+	Keep(device string, i int) error
+	Drop(device string, i int) error
+	Memories() *pilot.Memories
+}
+
+// PilotChecker is a Pilot that can check a model before a task, as
+// pilot.Runner.Check does: one tiny request with one tool. Check blocks;
+// the client calls it off the main thread.
+type PilotChecker interface {
+	Check(ctx context.Context, cfg pilot.Config) pilot.CheckResult
+}
+
+// PilotUsage is a Pilot that counts the tokens its model used, as
+// pilot.Runner.Usage does: by day, service and model, newest first.
+type PilotUsage interface {
+	Usage(since string) []pilot.UsageRow
 }
 
 // Settings are what the Settings screen changes.
@@ -143,9 +177,18 @@ type Settings struct {
 	ReadOnly           bool
 	UnlockFromComputer bool
 	HideCodes          bool
+	// VirtualCredentials lets agents type passwords and one-time codes on
+	// virtual phones (policy.File.VirtualCredentials).
+	VirtualCredentials bool
 	KeepDays           int
 	Record             bool
-	DeveloperMode      bool
+	// SmallerRecordings makes each task's recording smaller when the task
+	// ends (internal/recording.Smaller); off keeps the phone's own stream.
+	SmallerRecordings bool
+	// RecordingsDir is the folder new recordings go to; "" is Pinky's own
+	// (gateway.SetRecordingsDir).
+	RecordingsDir string
+	DeveloperMode bool
 	// RemoteAgents serves MCP over Streamable HTTP at RemoteAddr, for agents
 	// that cannot start `pinky mcp`; each request needs the agent token.
 	RemoteAgents bool
@@ -179,11 +222,19 @@ type Settings struct {
 	// AskPinky shows the box at the top of Tasks that gives Pinky's own
 	// agent a task (Options.Pilot).
 	AskPinky bool
-	// PilotProvider is the API Pinky's own agent reaches its model
-	// through, pilot.Anthropic or pilot.OpenAI. Each keeps its own model
-	// and address, so switching back finds them; empty ones are the
-	// defaults (pilot.Config.Normalize). The API keys are in the system's
-	// keychain (secret.ModelKeyAccount), never here.
+	// PilotService is the service Pinky's own agent reaches its model
+	// through (pilot.Services, by ID). Each service keeps its own model
+	// and address in PilotModels and PilotURLs, so switching back finds
+	// them; empty ones are the service's defaults (pilot.Config.Normalize).
+	// The API keys are in the system's keychain (secret.ModelKeyAccount of
+	// pilot.Config.KeyName), never here.
+	PilotService string
+	PilotModels  map[string]string `json:",omitempty"`
+	PilotURLs    map[string]string `json:",omitempty"`
+	// PilotProvider and the four after it are the settings of before
+	// there were services: the API, pilot.Anthropic or pilot.OpenAI, and
+	// each API's model and address. PilotConfig still reads them when
+	// PilotService, or its model or address, is not set.
 	PilotProvider       string
 	PilotAnthropicModel string
 	PilotAnthropicURL   string
@@ -194,18 +245,88 @@ type Settings struct {
 	PilotMaxSteps   int
 	PilotMaxMinutes int
 	PilotMaxCost    float64
+	// PilotNoMemory keeps tasks from reading and suggesting the person's
+	// notes (Settings › Agents › Ask Pinky › Memory); the notes stay.
+	PilotNoMemory bool
 }
 
 // PilotConfig is the pilot.Config of the settings.
 func (s Settings) PilotConfig() pilot.Config {
-	cfg := pilot.Config{
-		Provider: s.PilotProvider, Model: s.PilotAnthropicModel, BaseURL: s.PilotAnthropicURL,
-		MaxSteps: s.PilotMaxSteps, MaxTime: time.Duration(s.PilotMaxMinutes) * time.Minute, MaxCost: s.PilotMaxCost,
+	svc := s.pilotService()
+	if _, ok := pilot.ServiceByID(svc); !ok {
+		// A service this version does not know: the API of before.
+		s.PilotService = ""
+		svc = s.pilotService()
 	}
-	if s.PilotProvider == pilot.OpenAI {
-		cfg.Model, cfg.BaseURL = s.PilotOpenAIModel, s.PilotOpenAIURL
+	cfg := pilot.Config{
+		Service: svc, Model: s.pilotModel(svc), BaseURL: s.pilotURL(svc),
+		MaxSteps: s.PilotMaxSteps, MaxTime: time.Duration(s.PilotMaxMinutes) * time.Minute, MaxCost: s.PilotMaxCost,
+		NoMemory: s.PilotNoMemory,
 	}
 	return cfg.Normalize()
+}
+
+// pilotService is the service chosen, or the one the settings of before
+// there were services name.
+func (s Settings) pilotService() string {
+	if s.PilotService != "" {
+		return s.PilotService
+	}
+	url := s.PilotAnthropicURL
+	if s.PilotProvider == pilot.OpenAI {
+		url = s.PilotOpenAIURL
+	}
+	return pilot.ServiceFor(s.PilotProvider, url)
+}
+
+// pilotModel is the model chosen for a service: the one saved for it, else
+// the one saved for its API before there were services.
+func (s Settings) pilotModel(svc string) string {
+	if m, ok := s.PilotModels[svc]; ok {
+		return m
+	}
+	switch svc {
+	case pilot.Anthropic, pilot.CustomAnthropic:
+		return s.PilotAnthropicModel
+	case pilot.OpenAI, pilot.CustomOpenAI:
+		return s.PilotOpenAIModel
+	}
+	return ""
+}
+
+// pilotURL is the address chosen for a service, as pilotModel.
+func (s Settings) pilotURL(svc string) string {
+	if u, ok := s.PilotURLs[svc]; ok {
+		return u
+	}
+	switch svc {
+	case pilot.CustomAnthropic:
+		return s.PilotAnthropicURL
+	case pilot.CustomOpenAI:
+		return s.PilotOpenAIURL
+	}
+	return ""
+}
+
+// setPilotModel saves the model chosen for a service.
+func (s *Settings) setPilotModel(svc, model string) {
+	s.PilotModels = setIn(s.PilotModels, svc, model)
+}
+
+// setPilotURL saves the address chosen for a service.
+func (s *Settings) setPilotURL(svc, url string) {
+	s.PilotURLs = setIn(s.PilotURLs, svc, url)
+}
+
+// setIn sets m[k] in a copy of m, so that the settings reported before
+// keep theirs (clone).
+func setIn(m map[string]string, k, v string) map[string]string {
+	out := make(map[string]string, len(m)+1)
+	for mk, mv := range m {
+		out[mk] = mv
+	}
+	out[k] = v
+	return out
 }
 
 // DefaultRemoteAddr is where Pinky serves MCP over HTTP: this computer
@@ -234,7 +355,7 @@ func DefaultSettings() Settings {
 		BlockedApps: []BlockedApp{
 			{Name: "Northbank", Kind: "Banking"}, {Name: "Vaultly", Kind: "Passwords"}, {Name: "Coinpouch", Kind: "Wallet"},
 		},
-		UnlockFromComputer: true, HideCodes: true, KeepDays: 30, Record: true, RemoteAddr: DefaultRemoteAddr,
+		UnlockFromComputer: true, HideCodes: true, KeepDays: 30, Record: true, SmallerRecordings: true, RemoteAddr: DefaultRemoteAddr,
 		UsageStats:    usageStatsByDefault,
 		AutoUpdate:    true,
 		KeepAwakeAway: true,
@@ -321,9 +442,16 @@ type app struct {
 	// changes between the person's gestures on the mirror (phone.go).
 	control map[string]controlText
 
+	// phoneWins are the phones' own windows, by phone, and winTop the
+	// phones whose window stays on top of other apps' (phonewindow.go).
+	phoneWins map[string]*phoneWin
+	winTop    map[string]bool
+
 	quitting  bool
 	focused   bool // the main window has the keyboard
 	shortcut  string
+	keys      string // the keys the desktop bound to the shortcut, where it binds them (Wayland): none when the person declined it
+	keysTold  bool   // the desktop told keys
 	videoErr  error
 	buildSeq  int
 	updating  atomic.Bool
@@ -332,8 +460,10 @@ type app struct {
 	setq      settingsQueue // settings on their way to the gateway
 	postHook  func(func())  // tests run posted functions themselves
 	shownOnce bool          // the main window has shown (Options.Hidden)
+	docked    bool          // a hidden-started app has its Dock icon (regularApp)
 
 	mediaCache map[string]*mediaEntry // step screenshots by media id
+	mediaSweep bool                   // a sweepMedia is due (mediaKeep)
 	previews   map[string]bool        // steps whose screenshot shows in a task card
 	agents     agentsState
 	always     alwaysState       // Settings › Safety › Always allowed
@@ -350,8 +480,10 @@ type app struct {
 	t         telState       // usage statistics, crash reports and feedback
 	comp      companionState // the Android companion app, per phone
 	bg        bgState        // background displays, per phone
+	traffic   trafficState   // Read network traffic, per phone (traffic.go)
 	conn      connState      // iPhones: how Pinky connects, per phone
 	helper    helperState    // iPhones: installing the helper from the window (helper.go)
+	tasksTip  tasksTipState  // the card about tasks on the phone itself (phonetasks.go)
 	rec       recState       // task recordings in Activity
 	remote    remoteState    // Settings › Agents › Remote agents
 	webMirror webMirrorState // Settings › Phones › Web mirror
@@ -360,6 +492,8 @@ type app struct {
 	tn        tailnetState   // phones away from this computer's network, through Tailscale
 	phoneWiFi phoneWiFiState // phones without Wireless debugging moved to Wi-Fi (wifiswitch.go)
 	ask       askState       // Ask Pinky: the box at the top of Tasks, and its settings (ask.go)
+	sched     schedState     // Ask Pinky's scheduled tasks (schedules.go)
+	mem       memState       // Ask Pinky's notes, after a task and in its settings (memory.go)
 	rotate    rotateState    // Rotate in ⋯ under the mirror (rotate.go)
 
 	vit phoneVitalsState // phones' battery and storage (vitals.go)
@@ -372,6 +506,9 @@ type app struct {
 	awayAwakeOn bool
 	exportTo    func() (string, error) // where exports go; tests replace it
 	reveal      func(path string)      // shows an exported file; tests replace it
+	// openDialog is the system's open dialog (mygo.Dialog.Open) when nil;
+	// tests replace it.
+	openDialog func(mygo.OpenDialogOptions) ([]string, error)
 }
 
 // Run starts the client and returns when it quits. It owns the main
@@ -427,6 +564,7 @@ func newApp(api gateway.API, opt Options) *app {
 	a.bg = bgState{on: map[string]bool{}, busy: map[string]bool{}, phone: map[string]string{}}
 	a.rec = recState{views: map[string]*recEntry{}}
 	a.control = map[string]controlText{}
+	a.phoneWins, a.winTop = map[string]*phoneWin{}, map[string]bool{}
 	if opt.Settings != nil {
 		a.settings = opt.Settings.clone()
 	} else {
@@ -459,9 +597,11 @@ func (a *app) ready() {
 	a.devices, a.tasks = a.api.Devices(), a.api.Tasks()
 	a.setNeeds(a.api.Needs())
 	a.setBackgrounds(a.readBackground(a.devices))
+	a.setTraffics(a.readTraffic(a.devices))
 	a.loaded = true
 	a.applySettings()
 	a.afterRefresh(true)
+	a.startSchedules()
 
 	a.main = mygo.NewWindow(mygo.WindowOptions{
 		Title: "Pinky", Width: 1280, Height: 820, MinWidth: 960, MinHeight: 620,
@@ -496,7 +636,7 @@ func (a *app) ready() {
 	a.main.OnMinimize(a.closeMirrors)
 	a.main.OnShow(a.main.Invalidate)
 	a.main.OnRestore(a.main.Invalidate)
-	a.main.OnFocus(func() { a.focused = true; a.syncPanel() })
+	a.main.OnFocus(func() { a.focused = true; a.regularApp(); a.syncPanel() })
 	a.main.OnBlur(func() { a.focused = false; a.syncPanel() })
 	a.focused = a.main.IsFocused()
 
@@ -528,6 +668,7 @@ func (a *app) ready() {
 
 func (a *app) shutdown() {
 	a.end()
+	a.stopSchedules()
 	a.setAwake(false)
 	a.setAwayAwake(false)
 	for id, m := range a.mirrors {
@@ -565,6 +706,11 @@ func (a *app) post(fn func()) {
 func (a *app) invalidate() {
 	for _, w := range []*mygo.Window{a.panel, a.flyout, a.viewer} {
 		if w != nil && !w.IsDestroyed() {
+			w.Invalidate()
+		}
+	}
+	for _, pw := range a.phoneWins {
+		if w := pw.win; w != nil && !w.IsDestroyed() {
 			w.Invalidate()
 		}
 	}
@@ -616,10 +762,11 @@ func (a *app) refresh(devs, tasks, needs bool) {
 	var d []gateway.DeviceView
 	var t []gateway.TaskView
 	var n []gateway.NeedView
-	var bg map[string]bool
+	var bg, tr map[string]bool
 	if devs {
 		d = a.api.Devices()
 		bg = a.readBackground(d)
+		tr = a.readTraffic(d)
 	}
 	if tasks {
 		t = a.api.Tasks()
@@ -631,6 +778,7 @@ func (a *app) refresh(devs, tasks, needs bool) {
 		if devs {
 			a.devices = d
 			a.setBackgrounds(bg)
+			a.setTraffics(tr)
 			for id := range a.pin.wrong {
 				if dv := a.device(id); dv != nil && dv.Status != gateway.DeviceLocked && dv.Status != gateway.DeviceNeedsYou {
 					delete(a.pin.wrong, id) // unlocked on the phone: the person may try again
@@ -704,6 +852,7 @@ func (a *app) setAwake(on bool) {
 // them, at start; Settings passes each change the same way.
 func (a *app) applySettings() {
 	a.applyRecording(a.settings.Record)
+	a.applyRecordingSize(a.settings.SmallerRecordings)
 	a.applyRetention(a.settings.KeepDays)
 }
 
@@ -714,6 +863,12 @@ func (a *app) applySettings() {
 func (a *app) applyRecording(on bool) {
 	if rs, ok := a.api.(recordingSetter); ok {
 		a.setq.push("record", func() { rs.SetRecording(on) })
+	}
+}
+
+func (a *app) applyRecordingSize(smaller bool) {
+	if rs, ok := a.api.(recordingSizeSetter); ok {
+		a.setq.push("record-size", func() { rs.SetSmallerRecordings(smaller) })
 	}
 }
 
@@ -818,6 +973,7 @@ func (a *app) setNeeds(n []gateway.NeedView) {
 	if asks != a.agents.asks {
 		a.agents.asks, a.agents.lastLoad = asks, time.Time{}
 	}
+	a.agents.cardsChanged(a.needs, n)
 	a.needs = n
 	live := map[string]bool{}
 	for _, x := range n {
@@ -936,6 +1092,7 @@ func (a *app) selectPhone(id string) {
 }
 
 func (a *app) decide(n gateway.NeedView, d gateway.Decision, note string) {
+	a.agents.answered(n)
 	a.remember(n, d, note)
 	a.call(n.DeviceID, locales.CallAnswer(), func() error {
 		err := a.api.Decide(n.ID, d, note)
@@ -1002,15 +1159,19 @@ func (a *app) openForNeed(n gateway.NeedView) {
 		return
 	}
 	a.selectPhone(n.DeviceID)
-	a.regularApp()
+	a.shownOnce = true
 	a.main.ShowInactive()
 }
 
-// regularApp gives a hidden-started app its Dock icon once a window shows.
+// regularApp gives a hidden-started app its Dock icon when the person
+// opens or focuses its window. On macOS that also makes it the active app,
+// whose front window takes the keyboard, so a window that opened by itself
+// (openForNeed) waits for the person to come to it.
 func (a *app) regularApp() {
-	if a.opt.Hidden && !a.shownOnce && runtime.GOOS == "darwin" {
+	if a.opt.Hidden && !a.docked && runtime.GOOS == "darwin" {
 		mygo.App.SetActivationPolicy(mygo.ActivationPolicyRegular)
 	}
+	a.docked = true
 	a.shownOnce = true
 }
 
@@ -1070,15 +1231,34 @@ func (a *app) registerShortcut() {
 	if acc == "" {
 		acc = "CmdOrCtrl+Alt+."
 	}
-	if err := mygo.GlobalShortcut.Register(acc, a.stopAll); err != nil {
+	opts := mygo.GlobalShortcutOptions{
+		// What the desktop calls the shortcut where it asks about it and
+		// in its settings.
+		Description: locales.SidebarStopAll(),
+		OnKeys: func(keys string) {
+			a.keys, a.keysTold = keys, true
+			if a.main != nil && !a.main.IsDestroyed() {
+				a.main.Invalidate()
+			}
+			a.invalidate()
+		},
+	}
+	if err := mygo.GlobalShortcut.RegisterWith(acc, opts, a.stopAll); err != nil {
 		log.Printf("pinky: global shortcut %s: %v", acc, err)
 		return
 	}
 	a.shortcut = acc
 }
 
-// shortcutLabel is how the sidebar and the flyout write the shortcut.
-func shortcutLabel() string {
+// shortcutLabel is how the sidebar and the flyout write the shortcut:
+// nothing when there is none, or when the desktop bound no keys to it.
+func (a *app) shortcutLabel() string {
+	if a.shortcut == "" {
+		return ""
+	}
+	if a.keysTold {
+		return a.keys
+	}
 	if runtime.GOOS == "darwin" {
 		return "⌥⌘."
 	}

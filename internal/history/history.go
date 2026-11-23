@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite" // registers the "sqlite" driver
@@ -27,9 +28,10 @@ import (
 
 // schemaVersion is stored in PRAGMA user_version. Version 2 added the
 // recordings and device_settings tables, version 3 device_connections,
-// version 4 removed_devices, version 5 paused_devices; all versions open
-// the same way.
-const schemaVersion = 5
+// version 4 removed_devices, version 5 paused_devices, version 6
+// recording_removals, version 7 traffic_devices, traffic_routes and
+// traffic_blocklist; all versions open the same way.
+const schemaVersion = 7
 
 const schema = `
 CREATE TABLE IF NOT EXISTS devices (
@@ -145,6 +147,29 @@ CREATE TABLE IF NOT EXISTS paused_devices (
 	device_id TEXT PRIMARY KEY,
 	paused_at INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS recording_removals (
+	path TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS traffic_devices (
+	device_id TEXT PRIMARY KEY,
+	on_at     INTEGER NOT NULL DEFAULT 0,
+	route     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS traffic_blocklist (
+	device_id TEXT NOT NULL,
+	host      TEXT NOT NULL,
+	PRIMARY KEY (device_id, host)
+);
+
+CREATE TABLE IF NOT EXISTS traffic_routes (
+	device_id TEXT PRIMARY KEY,
+	prev      TEXT NOT NULL DEFAULT '',
+	port      INTEGER NOT NULL DEFAULT 0,
+	routed_at INTEGER NOT NULL DEFAULT 0
+);
 `
 
 // Store is the history database and its media and recordings folders.
@@ -153,7 +178,10 @@ type Store struct {
 	dir      string
 	mediaDir string
 	recDir   string
-	mu       sync.RWMutex // held for writing during Wipe and Prune
+	// userRecDir is the folder the person chose for new recordings, or ""
+	// for recDir (SetRecordingsDir).
+	userRecDir atomic.Pointer[string]
+	mu         sync.RWMutex // held for writing during Wipe and Prune
 }
 
 // Open opens or creates the store in dir: dir/pinky.db and dir/media/.
@@ -343,6 +371,67 @@ func (s *Store) SaveTask(ctx context.Context, t Task) error {
 	return err
 }
 
+// EndUnfinished ends the tasks and sessions that have no end: the ones
+// that ran when the Pinky before this one crashed or was killed, which the
+// history would otherwise show running for ever. A task ends at the end of
+// its last step (when it started, without one) with state and outcome; a
+// session ends when its last task did (when it started, without one) with
+// reason. An approval that was still open can no longer be answered: it
+// and its step get withdrawn as decision and status, at the time it was
+// asked. It returns how many tasks it ended. For a gateway's start, before
+// a task of its own runs.
+func (s *Store) EndUnfinished(ctx context.Context, state, outcome, reason, withdrawn string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE steps SET status = ?
+		WHERE (task_id, idx) IN (SELECT task_id, step_idx FROM approvals WHERE decision = '')`, withdrawn); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE approvals SET decision = ?, decided_at = created_at WHERE decision = ''`, withdrawn); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE tasks SET state = ?, outcome = ?, ended_at = MAX(started_at,
+			COALESCE((SELECT MAX(started_at + elapsed_ms) FROM steps WHERE task_id = tasks.id), 0))
+		WHERE ended_at = 0`, state, outcome)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET end_reason = ?, ended_at = MAX(started_at,
+			COALESCE((SELECT MAX(ended_at) FROM tasks WHERE session_id = sessions.id), 0))
+		WHERE ended_at = 0`, reason); err != nil {
+		return 0, err
+	}
+	return int(n), tx.Commit()
+}
+
+// EndAllowedSteps gives the steps that still have the status waiting,
+// though the person allowed them (their approval has one of the decisions
+// allowed), the status unsure: the Pinky before this one crashed or was
+// killed while it ran them, and nobody knows whether they happened. It
+// returns how many. For a gateway's start, as EndUnfinished.
+func (s *Store) EndAllowedSteps(ctx context.Context, waiting, unsure string, allowed ...string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	args := []any{unsure, waiting}
+	for _, d := range allowed {
+		args = append(args, d)
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE steps SET status = ? WHERE status = ?
+		AND (task_id, idx) IN (SELECT task_id, step_idx FROM approvals
+			WHERE decision IN (`+strings.TrimSuffix(strings.Repeat("?,", len(allowed)), ",")+`))`, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // Step is one tool call of a task.
 type Step struct {
 	TaskID     string
@@ -530,6 +619,24 @@ func (s *Store) Wipe(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	rows, err := txStrings(ctx, tx, `SELECT path FROM recordings`)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	// Recordings in a folder the person chose go one by one: the folder is
+	// theirs, and may hold other files.
+	var chosen []string
+	for _, row := range rows {
+		if filepath.IsAbs(row) {
+			chosen = append(chosen, row)
+		}
+	}
+	outside, err := s.dropRecordingFiles(ctx, tx, chosen)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
 	for _, t := range []string{"steps", "approvals", "tasks", "sessions", "media", "recordings"} {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+t); err != nil {
 			tx.Rollback()
@@ -539,17 +646,12 @@ func (s *Store) Wipe(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(s.mediaDir); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(s.mediaDir, 0o700); err != nil {
-		return err
-	}
-	if err := os.RemoveAll(s.recDir); err != nil {
-		return err
-	}
+	// The rows are gone: remove every file there is to remove, whatever
+	// fails on the way.
+	errs := []error{os.RemoveAll(s.mediaDir), os.MkdirAll(s.mediaDir, 0o700), os.RemoveAll(s.recDir),
+		s.removePending(ctx), s.removeDropped(ctx, outside)}
 	_, err = s.db.ExecContext(ctx, "VACUUM")
-	return err
+	return errors.Join(append(errs, err)...)
 }
 
 func digest(b []byte) string {

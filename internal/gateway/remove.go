@@ -18,8 +18,13 @@ import (
 // (an Android phone the adb server reconnects) stays off the list. It
 // comes back when the person adds it again: pairs it (StartPairing,
 // PairWithCode) or connects it by address (ConnectWiFi), or plugs it in,
-// since a phone listed with a cable is the person's doing. A phone still
-// plugged in comes back at once, as a new phone.
+// since a phone listed with a cable is the person's doing. Only a new
+// plug-in counts: the cable listing must come after the phone was seen
+// away from its cable - unlisted, or listed over Wi-Fi (removedUnplugged,
+// as with pausing, pause.go). A phone removed while on its cable stays
+// off the list until it is unplugged and plugged in again, so removing an
+// iPhone that charges from the computer does not undo itself, and the
+// same holds after a restart, the mark being in memory only.
 
 // RemoveOptions say what removing a phone deletes besides the phone itself.
 type RemoveOptions struct {
@@ -57,10 +62,10 @@ func (g *Gateway) RemoveDevice(ctx context.Context, deviceID string, opt RemoveO
 		g.endLeaseLocked(l, OutcomeStopped, "")
 	}
 	d.removed = true
-	delete(g.devices, d.id)
-	delete(g.background, d.id)
-	delete(g.known, d.id)
-	delete(g.chosen, d.id)
+	// Where the phone is now: away from its cable, the next plug-in adds
+	// it back, not this one (as with pausing, PauseDevice).
+	g.removedUnplugged[d.id] = !d.unlistedAt.IsZero() || !cabled(d.info) || d.info.Virtual
+	g.dropSettingsLocked(d.id)
 	forgetTaskWay(d)
 	g.removed[d.id] = true
 	if g.paused[d.id] {
@@ -133,6 +138,44 @@ func (g *Gateway) RemoveDevice(ctx context.Context, deviceID string, opt RemoveO
 	return err
 }
 
+// dropSettingsLocked takes the phone off the list with what the gateway
+// keeps about it in memory. The caller holds g.mu.
+func (g *Gateway) dropSettingsLocked(id string) {
+	delete(g.devices, id)
+	delete(g.background, id)
+	delete(g.trafficOn, id)
+	delete(g.trafficRoute, id)
+	g.dropTraffic(id)
+	g.cap.mu.Lock()
+	delete(g.cap.blocked, id)
+	g.cap.mu.Unlock()
+	g.captureSoon()
+	delete(g.known, id)
+	delete(g.chosen, id)
+}
+
+// forgetSettings deletes what is saved about a phone that left the list
+// without the person removing it (an emulator that went away, discover):
+// its record and settings, its read-only switch, how Pinky connects to it,
+// and approvals about it that no task holds. Its history stays, and it is
+// not kept off the list.
+func (g *Gateway) forgetSettings(p driver.Provider, id string) {
+	if g.store != nil {
+		g.rec.do(func(ctx context.Context) error { return g.store.ForgetDevice(ctx, id) })
+	}
+	gone := g.approvals.WithdrawWhere(func(i approval.Info) bool { return i.Binding.Device == id }, OutcomeStopped)
+	g.closePendingSteps(gone, OutcomeStopped)
+	g.stopHubs(id)
+	if err := g.policy.ForgetDevice(id); err != nil {
+		g.log.Warn("forget device: read-only switch", "device", id, "err", err)
+	}
+	if cc, ok := p.(driver.ConnectionChooser); ok {
+		if err := cc.SetConnection(id, driver.ConnectionAuto); err != nil {
+			g.log.Warn("forget device: connection", "device", id, "err", err)
+		}
+	}
+}
+
 // deleteDeviceHistory deletes the tasks of a removed phone that started
 // before it was removed, once what was being written about them is.
 func (g *Gateway) deleteDeviceHistory(ctx context.Context, id string, before time.Time) error {
@@ -180,6 +223,7 @@ func (g *Gateway) unremove(id string) {
 // so it keeps its order with RemoveDevice's Forget.
 func (g *Gateway) addedBackLocked(id string) {
 	delete(g.removed, id)
+	delete(g.removedUnplugged, id)
 	g.log.Info("removed device added back", "device", id)
 	if g.store != nil {
 		g.rec.do(func(ctx context.Context) error { return g.store.SetDeviceRemoved(ctx, id, false) })
