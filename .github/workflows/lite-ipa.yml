@@ -1,6 +1,11 @@
 name: lite-ipa
 
 # Builds Pinky's iPhone app (lite scheme) only — no desktop, no tests.
+#
+# This copy builds everything with one Xcode, as upstream does, to see
+# whether Xcode 26 and the iOS 26 SDK build the app and the pinned
+# WebDriverAgent as they stand — the app needs the iOS 26 SDK for
+# Look.swift's ToolbarItem(placement: .largeTitle).
 on:
   workflow_dispatch:
     inputs:
@@ -11,7 +16,11 @@ on:
       runner:
         description: "macOS runner label"
         required: false
-        default: "macos-15-intel"
+        default: "macos-15"
+      xcode:
+        description: "Xcode to build with, as the version prefix of /Applications/Xcode_<x>.app (e.g. 26, 26.0)"
+        required: false
+        default: "26"
 
 env:
   # The release Pinky builds its own helper from (internal/driver/ios/simwda.go):
@@ -23,9 +32,28 @@ env:
 jobs:
   build:
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+
+      - name: Pick Xcode
+        run: |
+          echo "== Xcodes on this image =="
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          echo "== default =="
+          xcodebuild -version || true
+          xcrun --sdk iphoneos --show-sdk-version || true
+          want="${{ inputs.xcode }}"
+          pick=$(ls -d /Applications/Xcode_${want}*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$pick" ]; then
+            echo "::error::neither an Xcode ${want}.x nor /Applications/Xcode_${want}*.app on this image; the list is above"
+            exit 1
+          fi
+          echo "using $pick"
+          sudo xcode-select -s "$pick"
+          echo "== now =="
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
 
       - uses: actions/setup-go@v5
         with:
@@ -70,6 +98,16 @@ jobs:
           ls -d "$APP"/PlugIns/* || true
           plutil -extract CFBundleShortVersionString raw -o - \
             "$APP"/PlugIns/WebDriverAgentRunner.xctest/Frameworks/WebDriverAgentLib.framework/Info.plist
+          echo "== what the app was built with =="
+          for k in MinimumOSVersion DTPlatformVersion DTSDKName DTXcodeBuild CFBundleIdentifier; do
+            printf '%s = ' "$k"
+            plutil -extract "$k" raw -o - "$APP"/Info.plist || echo "(none)"
+          done
+          echo "== what the test bundle was built with =="
+          for k in MinimumOSVersion DTPlatformVersion DTSDKName DTXcodeBuild; do
+            printf '%s = ' "$k"
+            plutil -extract "$k" raw -o - "$APP"/PlugIns/WebDriverAgentRunner.xctest/Info.plist || echo "(none)"
+          done
           mkdir -p out/Payload
           cp -R "$APP" out/Payload/
           cd out
